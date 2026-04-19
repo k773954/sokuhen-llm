@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sokuhen-llm"
+version = "0.1.0"
+description = "Windows用 LLM文脈対応ライブ変換日本語IME — sokuhen-llm"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "sokuhen-llm contributors" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Natural Language :: Japanese",
+    "Topic :: Text Processing :: Linguistic",
+]
+# Core IME deps. transformers/torch are under [llm] so users who want
+# to run without LLM rescoring don't pay the ~1 GB torch install.
+dependencies = [
+    "PyQt6>=6.6",
+    "pynput>=1.7.6",
+    "requests>=2.31",
+    "platformdirs>=4.0",
+]
+
+[project.optional-dependencies]
+# Local LLM rescoring layer. Adds ~1.5 GB to the environment
+# (torch + transformers + tokenizers). The model itself lands
+# in ./models/ after running download_model.
+llm = [
+    "transformers>=4.40",
+    "torch>=2.2",
+    "sentencepiece>=0.2",
+    "accelerate>=0.30",
+]
+
+[project.scripts]
+sokuhen-llm = "sokuhen_llm.__main__:main"
+
+[project.urls]
+Repository = "https://github.com/k773954/sokuhen-llm"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"sokuhen_llm" = ["data/*.json", "data/*.txt"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
+ignore = ["E501"]

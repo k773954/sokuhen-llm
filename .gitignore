@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg
+
+# Dictionary data (downloaded, large, regenerable)
+data/raw/
+data/*.dic
+data/*.dat
+data/SKK-JISYO.*
+!data/.gitkeep
+
+# LLM weights (downloaded, 400 MB+, regenerable via download_model)
+models/*
+!models/.gitkeep
+
+# User data
+user_data/
+*.user.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Local config
+.env
+settings.local.json
+
+# pytest / cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
