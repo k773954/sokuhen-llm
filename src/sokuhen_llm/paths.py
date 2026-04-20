@@ -58,3 +58,11 @@ def pid_file() -> Path:
     it on clean shutdown. The stop launcher reads it to find the running
     process."""
     return user_dir() / "sokuhen-llm.pid"
+
+
+def status_file() -> Path:
+    """Startup-progress marker read by the BAT launcher. A single line
+    of text -- ``loading`` / ``ready`` / ``failed:<msg>`` -- kept in
+    the user data dir so launchers can polling-wait for LLM readiness
+    before surrendering the console window."""
+    return user_dir() / "sokuhen-llm.status"

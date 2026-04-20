@@ -2021,6 +2021,16 @@ EXTRA_WORDS: list[tuple[str, str, int]] = [
     # 慣用句 of daily conversation
     ("こんなに", "こんなに", 300), ("そんなに", "そんなに", 300),
     ("あんなに", "あんなに", 300), ("どんなに", "どんなに", 300),
+    # まま -- SKK default is 「儘」/「其の儘」 (archaic kanji) but modern
+    # Japanese overwhelmingly uses hiragana for this expression, even in
+    # newspaper / Wikipedia prose. Boost hiragana so it wins against the
+    # SKK default cost ~3000.
+    ("まま", "まま", 300), ("ままに", "ままに", 300), ("ままで", "ままで", 300),
+    ("そのまま", "そのまま", 300), ("このまま", "このまま", 300),
+    ("あのまま", "あのまま", 300), ("どのまま", "どのまま", 400),
+    ("そのままに", "そのままに", 300), ("そのままで", "そのままで", 300),
+    # Correspondingly deprioritise the kanji form.
+    ("まま", "儘", 4000), ("そのまま", "其の儘", 4000),
     ("こんでる", "混んでる", 2400), ("こんでた", "混んでた", 2400),
     ("なった", "なった", 300), ("なって", "なって", 300),
     ("なっている", "なっている", 300), ("なっていた", "なっていた", 300),

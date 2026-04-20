@@ -230,19 +230,26 @@ class ImeCore(QObject):
         """Passive OS IME state poll (WM_IME_CONTROL, no
         AttachThreadInput). Runs on the Qt main thread via the timer.
 
-        We only act on transitions that the keyboard-hook observer
-        missed: specifically, when the hook has us at 'closed' but
-        the OS reports 'open'. That covers the user-reported case of
-        toggling IME ON via a custom shortcut (not 半角/全角). The
-        opposite direction (hook says open, OS says closed) is
-        deliberately ignored because some foreground apps return a
-        false 'closed' reading for their own reasons (no IME
-        context, browser DevTools windows, etc.) and we don't want
-        to silently disable sokuhen-llm when the user is mid-typing.
+        We only trust readings from the ``wm-ime-control`` source --
+        i.e., a real response from the foreground app's default IME
+        window. The fallback sources (``no-fg-hwnd``, ``no-ime-wnd``,
+        ``exception``) all return ``True`` as a safe default, but
+        that default is NOT evidence the IME is actually open; it
+        just means we couldn't tell. Using those readings caused the
+        user-reported bug where turning the IME OFF would resurrect
+        sokuhen-llm 1.5 s later (foreground lacked an IME context,
+        poll returned "True", we flipped our state back).
+
+        Even for valid readings we only act on the "closed -> open"
+        direction. Going the other way stays driven by the hook
+        observer so mid-typing IME contexts that briefly report
+        "closed" don't silently disable us.
         """
         try:
-            is_open, _source = _os_ime_state_with_source()
+            is_open, source = _os_ime_state_with_source()
         except Exception:
+            return
+        if source != "wm-ime-control":
             return
         if is_open and not self._os_ime_open:
             self._os_ime_open = True
@@ -766,6 +773,19 @@ class _AsyncRescorer:
         with self._status_lock:
             self._status = status
             self._error_message = error
+        # Persist the transition to disk so the launcher BAT can poll
+        # it and know when LLM is ready (or has failed). A single line
+        # of text -- ``loading`` / ``ready`` / ``failed:<first line of err>``.
+        try:
+            from .paths import status_file
+            line = status
+            if error:
+                # Keep single-line so ``set /p`` in BAT reads cleanly.
+                one_line = error.splitlines()[0][:200]
+                line = f"{status}:{one_line}"
+            status_file().write_text(line + "\n", encoding="utf-8")
+        except Exception:
+            log.debug("Failed to write status file", exc_info=True)
         cb = self._status_callback
         if cb is not None:
             try:
@@ -1146,6 +1166,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         # Not fatal — --stop won't work, but the IME can still run.
         log.warning("Could not write pid file %s: %s", pf, e)
 
+    # Seed the LLM status file so the launcher BAT can poll it from
+    # the very first iteration. _AsyncRescorer overwrites this as the
+    # load progresses.
+    try:
+        from .paths import status_file
+        status_file().write_text("starting\n", encoding="utf-8")
+    except Exception:
+        log.debug("Could not seed status file", exc_info=True)
+
     core, _converter, learning = _build_engine()
     window = CompositionWindow()
     indicator = StatusIndicator()
@@ -1179,8 +1208,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         rescorer.set_status_callback(lambda s: core.llm_status_changed.emit(s))
     else:
         # No rescorer (env disabled or deps missing). Show the
-        # "disabled" state in the chip from the start.
+        # "disabled" state in the chip from the start, AND persist
+        # it to the status file so the launcher BAT knows to stop
+        # waiting for an LLM that will never come.
         core.llm_status_changed.emit("disabled")
+        try:
+            from .paths import status_file as _sf
+            _sf().write_text("disabled\n", encoding="utf-8")
+        except Exception:
+            pass
 
     hook = KeyboardHook()
     hook.on_event = core.handle_event

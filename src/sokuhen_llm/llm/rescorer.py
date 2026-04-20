@@ -58,15 +58,18 @@ class RescoreConfig:
 
     # Viterbi-confidence gate: skip LLM rescoring entirely for a
     # segment if the gap between the best and second-best candidate
-    # is at least this many units of dictionary cost. In practice
-    # Viterbi is right when the gap is large and we save a costly
-    # LLM forward pass per segment.
+    # is at least this many units of dictionary cost.
     #
-    # Calibrated so that a 500-point gap (e.g., 2500 vs 3000) is
-    # treated as "confident enough". Tighter (100) = LLM sees more
-    # segments (slower + more flips); wider (2000) = LLM only sees
-    # near-tie segments (faster + fewer flips).
-    viterbi_confidence_gap: int = 500
+    # 0 (default) = disabled -- the LLM evaluates every ambiguous
+    # segment. Matches the user's "LLMモードの時はベースラインはなし"
+    # request: when LLM is enabled, its judgement is authoritative,
+    # not a sometimes-consulted second opinion.
+    #
+    # Positive values restore the gate for speed: 500 was the
+    # previous default (LLM only sees Viterbi-ties), 2000 = LLM
+    # only sees near-exact ties. Available for users who prefer
+    # speed over thoroughness.
+    viterbi_confidence_gap: int = 0
 
     # Prefix prepended to the whole surface before scoring, useful for
     # domain priming (e.g. "ニュース記事: "). Empty by default.
@@ -133,10 +136,17 @@ class Rescorer:
             # both speeds things up and prevents "style-preference"
             # flips like 見た↔観た or 違う↔ちがう that are all equally
             # valid but may deviate from the user's expected form.
-            cand0 = seg.candidates[0]
-            cand1 = seg.candidates[1]
-            if cand1.cost - cand0.cost >= confidence_gap:
-                continue
+            #
+            # ``confidence_gap <= 0`` disables the gate entirely --
+            # LLM is consulted on every multi-candidate segment.
+            # Sorted order guarantees cand0.cost <= cand1.cost, so
+            # ``gap >= 0`` is always true; treating 0 as "always skip"
+            # would gate out the whole LLM pass.
+            if confidence_gap > 0:
+                cand0 = seg.candidates[0]
+                cand1 = seg.candidates[1]
+                if cand1.cost - cand0.cost >= confidence_gap:
+                    continue
             best_idx = choices[i]
             best_score = _score_with_choice(
                 self.backend, prefix_prompt + frozen_prefix, result.segments,
