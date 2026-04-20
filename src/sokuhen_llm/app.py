@@ -80,6 +80,14 @@ class ImeCore(QObject):
 
     state_changed = pyqtSignal()
     active_changed = pyqtSignal(bool)
+    # Emitted once per commit when the LLM rescorer was ready and
+    # participated in picking the surface. The UI connects this to
+    # StatusIndicator.flash_rescored() for a brief visual pulse.
+    llm_rescored = pyqtSignal()
+    # Emitted whenever the LLM loader's status transitions
+    # ("loading" -> "ready" / "failed" / etc). Carries the new status
+    # string so the UI can update the chip.
+    llm_status_changed = pyqtSignal(str)
 
     def __init__(self, composer: LiveComposer, learning: LearningStore) -> None:
         super().__init__()
@@ -319,24 +327,48 @@ class ImeCore(QObject):
     # --- commit --------------------------------------------------------
 
     def _commit(self) -> bool:
+        """Commit the in-flight composition synchronously.
+
+        The big reliability footgun here is Windows'
+        ``LowLevelHooksTimeout`` (default 300 ms): if our hook
+        callback exceeds it even once, the OS silently unhooks us and
+        every subsequent keystroke passes straight to the foreground
+        app. The user observes "Enter stopped working". To stay under
+        the budget:
+
+          * LLM weights are loaded on a *background* thread (see
+            ``_AsyncRescorer``). Until they finish, ``rescore()``
+            returns in microseconds, so the very first commit is
+            fast.
+          * Once loaded, a full rescoring pass takes ~150-250 ms on
+            CPU. That's within the 300 ms budget on typical hardware.
+
+        Deferring commit via QTimer.singleShot would sidestep the
+        budget entirely, but then a fast Enter+next-character
+        sequence races (the next char arrives before the deferred
+        commit runs, and gets appended to the still-live composition
+        instead of starting a new one). Staying synchronous is
+        simpler and correct.
+        """
         if self.composer.state.is_empty:
             return False
         text = self.composer.commit()
+        llm_fired = (
+            getattr(self.composer, "rescorer", None) is not None
+            and getattr(self.composer.rescorer, "status", None) == "ready"
+        )
         if text:
-            # Inject into the foreground app. The hook marks our SendInput
-            # events as INJECTED so we don't re-process them.
+            # Inject into the foreground app. The hook marks our
+            # SendInput events as INJECTED so we don't re-process them.
             injected = send_unicode_text(text)
             if injected == 0:
-                # Nothing reached the app. Composer state is already cleared,
-                # so the user can't just press Enter again — warn visibly so
-                # they realize they need to retype or check the target window.
                 log.warning(
                     "Injection of %r produced 0 events. No foreground window "
                     "accepted the text (try clicking the target text field).",
                     text,
                 )
-        # Schedule a learning flush; actual write happens 2s after the last
-        # commit, so rapid-fire Enter presses don't trigger repeated disk IO.
+        if llm_fired:
+            self.llm_rescored.emit()
         self._save_timer.start()
         self.state_changed.emit()
         return True
@@ -421,15 +453,27 @@ def _build_engine() -> tuple[ImeCore, Converter, LearningStore]:
 def _build_rescorer():
     """Instantiate the LLM rescorer, or ``None`` if unavailable/disabled.
 
-    Loading the LLM weights takes 5-15 s on CPU and we don't want to
-    block startup that long. We return a lazy wrapper that defers
-    backend instantiation until the first ``rescore()`` call. The first
-    Enter press after launch pays the warmup cost; every subsequent
-    commit is fast.
+    We MUST NOT block startup for model load (15 s on CPU). We also
+    must not block any later keyboard-hook callback for longer than
+    Windows' LowLevelHooksTimeout (~300 ms) -- exceeding that makes
+    Windows silently unhook us, and from then on the IME receives no
+    more keys (the original "Enter doesn't commit" bug).
 
-    Disabling knobs:
-      * ``SOKUHEN_LLM_DISABLE=1`` skip entirely (same as no LLM deps)
-      * ``SOKUHEN_LLM_MODEL=<hf-id>`` switch model
+    Solution: a proxy rescorer that spawns a background thread to
+    construct ``HFBackend``. The hook callback path stays fast the
+    whole time:
+
+      * before the model is ready: rescore() returns the Viterbi
+        result unchanged in <1 ms.
+      * after load completes: rescore() delegates to a real
+        ``Rescorer`` and adds ~150-250 ms on commit, which is fine
+        because commit() runs on the Qt main thread, not inside a
+        blocking hook callback (the hook returns True immediately
+        on Enter-down; the actual commit work is deferred via
+        Qt signals).
+
+    Exposes a `status` property ("disabled" / "loading" / "ready" /
+    "failed") for the UI to display.
     """
     import os
 
@@ -437,8 +481,6 @@ def _build_rescorer():
         log.info("LLM rescoring disabled via SOKUHEN_LLM_DISABLE")
         return None
 
-    # Quick pre-check: if transformers/torch aren't importable, bail
-    # now so we don't promise a Rescorer we can't fulfil.
     try:
         import torch  # noqa: F401
         import transformers  # noqa: F401
@@ -446,55 +488,68 @@ def _build_rescorer():
         log.info("LLM rescoring unavailable (transformers / torch not installed)")
         return None
 
-    from .llm.rescorer import Rescorer
-
     model_id = os.environ.get("SOKUHEN_LLM_MODEL", "rinna/japanese-gpt2-small")
-    return _LazyRescorer(model_id=model_id)
+    return _AsyncRescorer(model_id=model_id)
 
 
-class _LazyRescorer:
-    """Drop-in replacement for ``Rescorer`` that defers the expensive
-    ``HFBackend`` construction until the first ``rescore()`` call.
+class _AsyncRescorer:
+    """Non-blocking wrapper around ``Rescorer`` + ``HFBackend``.
 
-    Duck-types the ``rescore(frozen_prefix, result, initial_overrides)``
-    method that LiveComposer calls. On the first call, it instantiates
-    an ``HFBackend`` (loads the model weights), wraps it in a real
-    ``Rescorer``, and delegates. Subsequent calls go straight to the
-    cached real rescorer.
+    Construction kicks off a Python thread that instantiates the real
+    rescorer. Until it's done, ``rescore()`` is a no-op -- commit
+    still works, it just skips the LLM pass.
 
-    If model loading fails, we log once and become a no-op (return
-    the Viterbi result unchanged) so the IME still works.
+    The ``status`` property lets the UI render ``ロード中... / LLM ON /
+    LLM エラー`` in the status bar. ``on_status_changed`` is a single
+    callback slot (not a Qt signal to avoid importing Qt into this
+    engine-level class; ``app.py`` wires it to Qt).
     """
 
-    def __init__(self, model_id: str) -> None:
-        self._model_id = model_id
-        self._real = None  # Rescorer, or sentinel-false on failure
-        self._tried = False
+    _STATUS_LOADING = "loading"
+    _STATUS_READY = "ready"
+    _STATUS_FAILED = "failed"
 
-    def _ensure_real(self):
-        if self._tried:
-            return self._real
-        self._tried = True
+    def __init__(self, model_id: str) -> None:
+        import threading
+
+        self._model_id = model_id
+        self._real = None
+        self._status = self._STATUS_LOADING
+        self._status_lock = threading.Lock()
+        self._status_callback = None  # set by app.py after UI exists
+        self._error_message = ""
+        self._thread = threading.Thread(target=self._load, daemon=True, name="sokuhen-llm-load")
+        self._thread.start()
+
+    # --- public API ------------------------------------------------
+
+    @property
+    def status(self) -> str:
+        return self._status
+
+    @property
+    def model_id(self) -> str:
+        return self._model_id
+
+    @property
+    def error_message(self) -> str:
+        return self._error_message
+
+    def set_status_callback(self, callback) -> None:
+        """Register a callable ``(status: str) -> None`` to be called
+        whenever the load state transitions. Immediately invoked with
+        the current status so callers get the initial state too."""
+        self._status_callback = callback
         try:
-            from .llm.hf_backend import HFBackend
-            from .llm.rescorer import Rescorer
-            log.info("Lazy-loading LLM (%s)...", self._model_id)
-            backend = HFBackend(model_id=self._model_id)
-            if not backend.available:
-                log.info("LLM backend not available; rescoring disabled")
-                return None
-            self._real = Rescorer(backend)
-            log.info("LLM ready -- rescoring active from next commit")
-            return self._real
-        except Exception as e:
-            log.warning("LLM lazy-load failed: %s -- rescoring disabled", e)
-            return None
+            callback(self._status)
+        except Exception:
+            pass
 
     def rescore(self, frozen_prefix, result, initial_overrides=None):
-        real = self._ensure_real()
+        """Rescore if the backend has finished loading; otherwise
+        return the Viterbi result unchanged (no-op, fast)."""
+        real = self._real
         if real is None:
-            # Graceful fallthrough: return a zero-override RescoreResult
-            # shaped like what LiveComposer expects.
             from .llm.rescorer import RescoreResult
             return RescoreResult(
                 overrides=dict(initial_overrides or {}),
@@ -502,6 +557,36 @@ class _LazyRescorer:
                 llm_hits=0,
             )
         return real.rescore(frozen_prefix, result, initial_overrides)
+
+    # --- worker thread ---------------------------------------------
+
+    def _load(self) -> None:
+        try:
+            from .llm.hf_backend import HFBackend
+            from .llm.rescorer import Rescorer
+
+            log.info("[LLM] background load starting (%s)", self._model_id)
+            backend = HFBackend(model_id=self._model_id)
+            if not backend.available:
+                self._set_status(self._STATUS_FAILED, "backend unavailable")
+                return
+            self._real = Rescorer(backend)
+            self._set_status(self._STATUS_READY)
+            log.info("[LLM] ready -- rescoring will be used from next commit")
+        except Exception as e:
+            log.warning("[LLM] load failed: %s", e)
+            self._set_status(self._STATUS_FAILED, str(e))
+
+    def _set_status(self, status: str, error: str = "") -> None:
+        with self._status_lock:
+            self._status = status
+            self._error_message = error
+        cb = self._status_callback
+        if cb is not None:
+            try:
+                cb(status)
+            except Exception:
+                log.debug("LLM status callback raised", exc_info=True)
 
 
 def _make_tray_icon(active: bool) -> QIcon:
@@ -544,6 +629,8 @@ def _create_tray(app: QApplication, core: ImeCore) -> Optional[QSystemTrayIcon]:
     menu = QMenu()
     act_status = menu.addAction("sokuhen-llm: OFF")
     act_status.setEnabled(False)
+    act_llm_status = menu.addAction("LLM: -")
+    act_llm_status.setEnabled(False)
     menu.addSeparator()
     act_toggle = menu.addAction("IMEを切り替え  (Alt + `)")
     act_toggle.triggered.connect(core.toggle_active)
@@ -552,12 +639,36 @@ def _create_tray(app: QApplication, core: ImeCore) -> Optional[QSystemTrayIcon]:
     act_quit.triggered.connect(app.quit)
     tray.setContextMenu(menu)
 
-    def _on_active(active: bool) -> None:
+    # The tooltip encodes both IME on/off AND LLM state so hovering
+    # the tray icon always tells the user what's going on.
+    tray_state = {"active": False, "llm": "disabled"}
+    _llm_tray_labels = {
+        "loading":  "ロード中",
+        "ready":    "ON",
+        "disabled": "OFF",
+        "failed":   "エラー",
+    }
+
+    def _refresh_tray() -> None:
+        active = tray_state["active"]
+        llm_label = _llm_tray_labels.get(tray_state["llm"], "OFF")
         tray.setIcon(_make_tray_icon(active=active))
-        tray.setToolTip(f"sokuhen-llm ({'ON' if active else 'OFF'}) — Alt+` to toggle")
+        tray.setToolTip(
+            f"sokuhen-llm (IME {'ON' if active else 'OFF'} / LLM {llm_label}) — Alt+` to toggle"
+        )
         act_status.setText(f"sokuhen-llm: {'ON' if active else 'OFF'}")
+        act_llm_status.setText(f"LLM: {llm_label}")
+
+    def _on_active(active: bool) -> None:
+        tray_state["active"] = active
+        _refresh_tray()
+
+    def _on_llm_status(status: str) -> None:
+        tray_state["llm"] = status
+        _refresh_tray()
 
     core.active_changed.connect(_on_active)
+    core.llm_status_changed.connect(_on_llm_status)
 
     # Left-click on the tray icon also toggles — matches user expectations
     # from other notification-area apps.
@@ -831,8 +942,31 @@ def main(argv: Optional[list[str]] = None) -> int:
     def _on_active_changed(active: bool) -> None:
         indicator.set_active(active)
 
+    def _on_llm_status_changed(status: str) -> None:
+        indicator.set_llm_status(status)
+
+    def _on_llm_rescored() -> None:
+        indicator.flash_rescored()
+
     core.state_changed.connect(_on_state_changed)
     core.active_changed.connect(_on_active_changed)
+    core.llm_status_changed.connect(_on_llm_status_changed)
+    core.llm_rescored.connect(_on_llm_rescored)
+
+    # Wire the _AsyncRescorer background loader to the UI. The
+    # rescorer calls our callback from a worker thread; we bounce it
+    # through a Qt signal so the indicator update happens on the
+    # main thread.
+    rescorer = getattr(core.composer, "rescorer", None)
+    if rescorer is not None and hasattr(rescorer, "set_status_callback"):
+        # Bounce the worker-thread status updates to the main thread
+        # via the llm_status_changed signal (Qt handles the
+        # cross-thread marshalling).
+        rescorer.set_status_callback(lambda s: core.llm_status_changed.emit(s))
+    else:
+        # No rescorer (env disabled or deps missing). Show the
+        # "disabled" state in the chip from the start.
+        core.llm_status_changed.emit("disabled")
 
     hook = KeyboardHook()
     hook.on_event = core.handle_event

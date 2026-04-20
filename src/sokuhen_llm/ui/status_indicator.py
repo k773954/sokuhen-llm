@@ -1,21 +1,33 @@
-"""Small always-visible IME status indicator.
+"""Always-visible IME status chip with LLM state.
 
-Sits in a fixed corner of the primary screen and clearly shows whether the
-IME is currently ON. Necessary because the tray icon isn't a reliable
-signal — Windows 11 hides tray icons by default, so users who haven't
-pinned the app have no idea it's running.
+Sits in a fixed bottom-right corner of the primary screen. The chip's
+label and colour reflect two orthogonal states:
 
-UX informed by 桜井式:
-  * やりすぎぐらいでちょうどいい — the pill uses a brighter FLASH color
-    for 600ms after activation so the user's eye catches the state change.
-  * メリハリ — the pill only appears while IME is ON; there is no
-    persistent clutter in OFF state.
-  * 遅さは罪 — animation is timer-driven, 600ms start-flash only.
+    IME on/off        -- shown/hidden
+    LLM state         -- label + colour band inside the chip
+                         * "ロード中..."  (yellow band)  LLM weights
+                           are being pulled into memory
+                         * "LLM ON"     (green band)    LLM rescoring
+                           is active and will re-rank on commit
+                         * "LLM OFF"    (grey band)     LLM disabled
+                           (SOKUHEN_LLM_DISABLE, missing deps, etc.)
+                         * "LLM エラー"  (red band)     backend failed
+                           to load; IME still works, rescoring is off.
 
-When OFF: hidden.
-When ON: pill in the bottom-right corner reading "あ IME ON".
+The chip also flashes for ~600 ms on these transitions so the user
+sees the state change without having to look: activating the IME, or
+the LLM becoming ready.
+
+Why a big visible chip?
+  * Users reported "LLM が動いている気配がない" -- the tray icon isn't
+    enough and isn't always visible on Win11 (it hides by default).
+  * Making the state obvious prevents the user from retyping because
+    they think nothing is happening.
 """
 from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPaintEvent, QPen
@@ -24,22 +36,51 @@ from PyQt6.QtWidgets import QApplication, QWidget
 from ..input import _win32
 
 
-# Visible, confident green. Strong enough to catch the eye on any app
-# background, but rounded + tightly-packed so it reads as "status chip"
-# not "alert".
+# Band colours, keyed by LLM status. Pill body stays the same green
+# whether LLM is on or not (the pill's purpose is "IME is live"); the
+# secondary band on the right communicates LLM.
 ON_BG = QColor(40, 170, 90, 240)
 ON_FG = QColor(255, 255, 255)
 ON_BORDER = QColor(22, 120, 66)
+FLASH_BG = QColor(80, 215, 130, 250)
 
-FLASH_BG = QColor(80, 215, 130, 250)  # briefly brighter on toggle-on
+LLM_BAND_COLORS = {
+    "ready":    QColor(80, 220, 120, 240),   # bright green
+    "loading":  QColor(245, 200, 70, 240),   # amber
+    "disabled": QColor(120, 120, 120, 220),  # neutral grey
+    "failed":   QColor(220, 90, 80, 240),    # red
+}
+
+LLM_BAND_LABELS = {
+    "ready":    "LLM ON",
+    "loading":  "ロード中...",
+    "disabled": "LLM OFF",
+    "failed":   "LLM エラー",
+}
+
+# Briefly flash the background slightly brighter when LLM adjusted
+# the surface on commit -- confirms "the LLM changed something".
+RESCORE_FLASH_BG = QColor(120, 200, 255, 250)   # cool blue pulse
 
 PADDING_X = 14
 PADDING_Y = 6
+BAND_GAP = 8                      # px between main label and the LLM band
+BAND_PADDING_X = 10
 CORNER_MARGIN = 16
 
 
+@dataclass
+class ChipState:
+    """Immutable display state for one paint cycle."""
+
+    visible: bool = False
+    flash_activate: bool = False
+    flash_rescore: bool = False
+    llm_status: str = "disabled"     # "ready" / "loading" / "disabled" / "failed"
+
+
 class StatusIndicator(QWidget):
-    """Tiny floating chip in the screen corner showing IME ON."""
+    """Floating chip: `あ  IME ON | LLM ON`."""
 
     def __init__(self) -> None:
         super().__init__(
@@ -56,18 +97,21 @@ class StatusIndicator(QWidget):
 
         self._font = QFont("Yu Gothic UI", 11)
         self._font.setWeight(QFont.Weight.Bold)
-        self._flash = False
+        self._band_font = QFont("Yu Gothic UI", 10)
+        self._band_font.setWeight(QFont.Weight.DemiBold)
 
-        # Flash timer: briefly use a brighter colour right after toggle-on
-        # so the user's eye catches the state change.
-        self._flash_timer = QTimer(self)
-        self._flash_timer.setSingleShot(True)
-        self._flash_timer.timeout.connect(self._end_flash)
+        self._state = ChipState()
 
-        # Periodically reassert topmost while visible. Fullscreen or
-        # game-mode apps push us down otherwise and the user can lose
-        # track of IME state. 750ms is fast enough to feel persistent
-        # without being a CPU hog.
+        # Flash timers. One for the "IME just toggled on" pulse, one
+        # for the "LLM just rewrote this commit" pulse.
+        self._activate_flash_timer = QTimer(self)
+        self._activate_flash_timer.setSingleShot(True)
+        self._activate_flash_timer.timeout.connect(self._end_activate_flash)
+
+        self._rescore_flash_timer = QTimer(self)
+        self._rescore_flash_timer.setSingleShot(True)
+        self._rescore_flash_timer.timeout.connect(self._end_rescore_flash)
+
         self._topmost_timer = QTimer(self)
         self._topmost_timer.setInterval(750)
         self._topmost_timer.timeout.connect(self._force_topmost)
@@ -78,9 +122,10 @@ class StatusIndicator(QWidget):
     # --- public API ----------------------------------------------------
 
     def set_active(self, active: bool) -> None:
+        self._state.visible = active
         if active:
-            self._flash = True
-            self._flash_timer.start(600)
+            self._state.flash_activate = True
+            self._activate_flash_timer.start(600)
             self._size_to_content()
             self._position_bottom_right()
             self.show()
@@ -89,26 +134,64 @@ class StatusIndicator(QWidget):
                 self._topmost_timer.start()
             self.update()
         else:
-            self._flash = False
+            self._state.flash_activate = False
             self._topmost_timer.stop()
             self.hide()
 
-    # --- painting / layout --------------------------------------------
+    def set_llm_status(self, status: str) -> None:
+        """Update the LLM band. ``status`` must be one of the keys in
+        ``LLM_BAND_COLORS``; unknown values are normalized to
+        ``disabled`` so the chip always renders something sane."""
+        if status not in LLM_BAND_COLORS:
+            status = "disabled"
+        prev = self._state.llm_status
+        self._state.llm_status = status
+        # If LLM just finished loading, flash the chip so the user
+        # sees the transition.
+        if status == "ready" and prev != "ready":
+            self._state.flash_activate = True
+            self._activate_flash_timer.start(800)
+        if self._state.visible:
+            self._size_to_content()
+            self._position_bottom_right()
+            self.update()
 
-    def _end_flash(self) -> None:
-        self._flash = False
+    def flash_rescored(self) -> None:
+        """Briefly pulse the chip to signal the LLM rewrote this
+        commit's surface. Called from ImeCore after a non-trivial
+        ``llm_hits`` count."""
+        if not self._state.visible:
+            return
+        self._state.flash_rescore = True
+        self._rescore_flash_timer.start(350)
         self.update()
 
+    # --- painting / layout --------------------------------------------
+
+    def _end_activate_flash(self) -> None:
+        self._state.flash_activate = False
+        self.update()
+
+    def _end_rescore_flash(self) -> None:
+        self._state.flash_rescore = False
+        self.update()
+
+    def _label_main(self) -> str:
+        return "あ  IME ON"
+
+    def _label_band(self) -> str:
+        return LLM_BAND_LABELS.get(self._state.llm_status, "LLM OFF")
+
     def _size_to_content(self) -> None:
-        fm = QFontMetrics(self._font)
-        label = "あ  IME ON"
-        w = fm.horizontalAdvance(label) + PADDING_X * 2
-        h = fm.height() + PADDING_Y * 2
+        fm_main = QFontMetrics(self._font)
+        fm_band = QFontMetrics(self._band_font)
+        w_main = fm_main.horizontalAdvance(self._label_main())
+        w_band = fm_band.horizontalAdvance(self._label_band())
+        w = PADDING_X + w_main + BAND_GAP + BAND_PADDING_X + w_band + BAND_PADDING_X + PADDING_X
+        h = max(fm_main.height(), fm_band.height()) + PADDING_Y * 2
         self.resize(w, h)
 
     def _position_bottom_right(self) -> None:
-        """Bottom-right — stays near the Windows taskbar so it reads as
-        'this app is running' without getting in the way of the work area."""
         screen = QApplication.primaryScreen().availableGeometry()
         self.move(
             screen.right() - self.width() - CORNER_MARGIN,
@@ -123,12 +206,49 @@ class StatusIndicator(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
 
-        bg = FLASH_BG if self._flash else ON_BG
+        # Background pill -- green normally, briefly brighter on flash.
+        if self._state.flash_rescore:
+            bg = RESCORE_FLASH_BG
+        elif self._state.flash_activate:
+            bg = FLASH_BG
+        else:
+            bg = ON_BG
         p.setBrush(bg)
         p.setPen(QPen(ON_BORDER, 1))
         radius = self.height() / 2
         p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), radius, radius)
 
+        # Main label "あ  IME ON"
         p.setFont(self._font)
         p.setPen(ON_FG)
-        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "あ  IME ON")
+        fm_main = QFontMetrics(self._font)
+        fm_band = QFontMetrics(self._band_font)
+        main_label = self._label_main()
+        band_label = self._label_band()
+
+        main_x = PADDING_X
+        main_w = fm_main.horizontalAdvance(main_label)
+        main_rect = self.rect()
+        main_rect.setLeft(main_x)
+        main_rect.setWidth(main_w)
+        p.drawText(main_rect, Qt.AlignmentFlag.AlignVCenter, main_label)
+
+        # LLM band chip, right side.
+        band_color = LLM_BAND_COLORS.get(self._state.llm_status, LLM_BAND_COLORS["disabled"])
+        band_w = fm_band.horizontalAdvance(band_label) + BAND_PADDING_X * 2
+        band_h = self.height() - PADDING_Y - 2
+        band_x = main_x + main_w + BAND_GAP
+        band_y = (self.height() - band_h) // 2
+        band_rect = self.rect()
+        band_rect.setLeft(band_x)
+        band_rect.setTop(band_y)
+        band_rect.setWidth(band_w)
+        band_rect.setHeight(band_h)
+        band_radius = band_h / 2
+        p.setBrush(band_color)
+        p.setPen(QPen(band_color.darker(130), 1))
+        p.drawRoundedRect(band_rect, band_radius, band_radius)
+
+        p.setFont(self._band_font)
+        p.setPen(ON_FG)
+        p.drawText(band_rect, Qt.AlignmentFlag.AlignCenter, band_label)

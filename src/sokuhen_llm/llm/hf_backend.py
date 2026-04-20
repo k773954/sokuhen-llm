@@ -73,28 +73,40 @@ class HFBackend:
 
         self._torch = torch
 
-        # Resolve whether the model-id is a local path or a hub id.
-        candidate_local = self.cache_dir / self.model_id.replace("/", "--")
-        if candidate_local.exists():
-            load_src: str | Path = candidate_local
-            local_only = True
-        else:
-            load_src = self.model_id
-            local_only = False
+        # HuggingFace's cache_dir layout stores model ``org/name`` under
+        # ``cache_dir/models--<org>--<name>/``. Peek there to decide
+        # whether we can pass ``local_files_only=True`` -- keeps the
+        # load path completely offline after first download and avoids
+        # the HEAD / "check for updates" round trips that otherwise
+        # happen on every startup.
+        hf_cache_subdir = (
+            self.cache_dir / f"models--{self.model_id.replace('/', '--')}"
+        )
+        local_only = hf_cache_subdir.exists()
 
         try:
-            log.info("Loading LLM: %s (local_only=%s)", load_src, local_only)
+            log.info(
+                "Loading LLM: %s (cache=%s, local_only=%s)",
+                self.model_id, self.cache_dir, local_only,
+            )
             self._tokenizer = AutoTokenizer.from_pretrained(
-                load_src, cache_dir=str(self.cache_dir), local_files_only=local_only
+                self.model_id,
+                cache_dir=str(self.cache_dir),
+                local_files_only=local_only,
             )
             self._model = AutoModelForCausalLM.from_pretrained(
-                load_src, cache_dir=str(self.cache_dir), local_files_only=local_only
+                self.model_id,
+                cache_dir=str(self.cache_dir),
+                local_files_only=local_only,
             )
             self._model.eval()
             self._model.to(self.device)
             self._available = True
-            log.info("LLM loaded (device=%s, params=%s)", self.device,
-                     f"{sum(p.numel() for p in self._model.parameters()):,}")
+            log.info(
+                "LLM loaded (device=%s, params=%s)",
+                self.device,
+                f"{sum(p.numel() for p in self._model.parameters()):,}",
+            )
         except Exception as e:
             log.warning("LLM load failed: %s", e)
             self._available = False
