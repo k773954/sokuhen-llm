@@ -211,6 +211,23 @@ class ImeCore(QObject):
         ):
             return False
 
+        # Shift + ASCII letter: flush any pending composition and pass the
+        # keystroke through so the app receives a normal uppercase letter.
+        # Users commonly want to type identifiers, model numbers, English
+        # words etc. mid-sentence without toggling the IME off. Shift-A
+        # through Shift-Z keep their muscle-memory behavior and never
+        # enter the romaji→kana converter.
+        if (
+            ev.pressed
+            and Modifiers.SHIFT in ev.modifiers
+            and ev.char
+            and len(ev.char) == 1
+            and "A" <= ev.char <= "Z"
+        ):
+            if not self.composer.state.is_empty:
+                self._commit()
+            return False
+
         if not ev.pressed:
             # IME is edge-triggered on key-down. Key-up passes through silently,
             # which prevents the OS seeing orphan key-ups for suppressed keys.
@@ -503,11 +520,24 @@ class _AsyncRescorer:
     LLM エラー`` in the status bar. ``on_status_changed`` is a single
     callback slot (not a Qt signal to avoid importing Qt into this
     engine-level class; ``app.py`` wires it to Qt).
+
+    Fallback chain:
+      If the primary model fails to load (missing tokenizer deps,
+      corrupted cache, etc.) we try a secondary model -- usually one
+      with a fast tokenizer that has fewer runtime dependencies --
+      before giving up. The user sees transient "LLM エラー" flicker
+      but the IME becomes functional with the fallback.
     """
 
     _STATUS_LOADING = "loading"
     _STATUS_READY = "ready"
     _STATUS_FAILED = "failed"
+
+    # Secondary model to try if the primary fails. cyberagent/open-calm-small
+    # uses GPTNeoXTokenizerFast (the ``tokenizers`` crate) -- no
+    # sentencepiece / protobuf / tiktoken conversion path, so it's
+    # more robust across Python and transformers versions.
+    _FALLBACK_MODEL = "cyberagent/open-calm-small"
 
     def __init__(self, model_id: str) -> None:
         import threading
@@ -518,6 +548,7 @@ class _AsyncRescorer:
         self._status_lock = threading.Lock()
         self._status_callback = None  # set by app.py after UI exists
         self._error_message = ""
+        self._active_model_id = model_id
         self._thread = threading.Thread(target=self._load, daemon=True, name="sokuhen-llm-load")
         self._thread.start()
 
@@ -530,6 +561,12 @@ class _AsyncRescorer:
     @property
     def model_id(self) -> str:
         return self._model_id
+
+    @property
+    def active_model_id(self) -> str:
+        """The model currently backing ``rescore`` -- may differ from
+        ``model_id`` if we fell back after an error."""
+        return self._active_model_id
 
     @property
     def error_message(self) -> str:
@@ -561,21 +598,44 @@ class _AsyncRescorer:
     # --- worker thread ---------------------------------------------
 
     def _load(self) -> None:
-        try:
-            from .llm.hf_backend import HFBackend
-            from .llm.rescorer import Rescorer
+        # Try the primary model, then the fallback. The fallback is
+        # skipped if the primary IS the fallback (user overrode via
+        # SOKUHEN_LLM_MODEL).
+        attempts = [self._model_id]
+        if self._FALLBACK_MODEL != self._model_id:
+            attempts.append(self._FALLBACK_MODEL)
 
-            log.info("[LLM] background load starting (%s)", self._model_id)
-            backend = HFBackend(model_id=self._model_id)
-            if not backend.available:
-                self._set_status(self._STATUS_FAILED, "backend unavailable")
+        last_error = "unknown"
+        for i, model_id in enumerate(attempts):
+            label = "primary" if i == 0 else "fallback"
+            try:
+                from .llm.hf_backend import HFBackend
+                from .llm.rescorer import Rescorer
+
+                log.info("[LLM] loading %s model: %s", label, model_id)
+                backend = HFBackend(model_id=model_id)
+                if not backend.available:
+                    last_error = f"{model_id}: backend unavailable"
+                    log.warning("[LLM] %s backend not available", label)
+                    continue
+                self._real = Rescorer(backend)
+                self._active_model_id = model_id
+                if i > 0:
+                    log.info(
+                        "[LLM] primary (%s) failed; using fallback %s",
+                        self._model_id, model_id,
+                    )
+                self._set_status(self._STATUS_READY)
+                log.info("[LLM] ready -- rescoring from %s", model_id)
                 return
-            self._real = Rescorer(backend)
-            self._set_status(self._STATUS_READY)
-            log.info("[LLM] ready -- rescoring will be used from next commit")
-        except Exception as e:
-            log.warning("[LLM] load failed: %s", e)
-            self._set_status(self._STATUS_FAILED, str(e))
+            except Exception as e:
+                # Log the full traceback to the log file so it can be
+                # copy-pasted into a bug report. The short message is
+                # what the UI shows.
+                log.exception("[LLM] %s load failed: %s", label, model_id)
+                last_error = f"{model_id}: {e}"
+
+        self._set_status(self._STATUS_FAILED, last_error)
 
     def _set_status(self, status: str, error: str = "") -> None:
         with self._status_lock:
@@ -649,15 +709,44 @@ def _create_tray(app: QApplication, core: ImeCore) -> Optional[QSystemTrayIcon]:
         "failed":   "エラー",
     }
 
+    def _current_llm_error() -> str:
+        """Return a short, one-line description of the last LLM load
+        error, or '' when none."""
+        rescorer = getattr(core.composer, "rescorer", None)
+        if rescorer is None:
+            return ""
+        msg = getattr(rescorer, "error_message", "") or ""
+        return msg.splitlines()[0][:80] if msg else ""
+
     def _refresh_tray() -> None:
         active = tray_state["active"]
-        llm_label = _llm_tray_labels.get(tray_state["llm"], "OFF")
+        status = tray_state["llm"]
+        llm_label = _llm_tray_labels.get(status, "OFF")
         tray.setIcon(_make_tray_icon(active=active))
-        tray.setToolTip(
-            f"sokuhen-llm (IME {'ON' if active else 'OFF'} / LLM {llm_label}) — Alt+` to toggle"
+        tooltip = (
+            f"sokuhen-llm (IME {'ON' if active else 'OFF'} / LLM {llm_label})"
+            " — Alt+` to toggle"
         )
+        if status == "failed":
+            err = _current_llm_error()
+            if err:
+                tooltip += f"\nLLM error: {err}"
+        tray.setToolTip(tooltip)
         act_status.setText(f"sokuhen-llm: {'ON' if active else 'OFF'}")
-        act_llm_status.setText(f"LLM: {llm_label}")
+        if status == "failed":
+            err = _current_llm_error()
+            act_llm_status.setText(f"LLM: エラー — {err[:50]}" if err else "LLM: エラー")
+        elif status == "ready":
+            rescorer = getattr(core.composer, "rescorer", None)
+            mid = getattr(rescorer, "active_model_id", "") if rescorer else ""
+            # Show the model path so the user sees which one is loaded
+            # (primary vs fallback).
+            short_mid = mid.split("/")[-1] if mid else ""
+            act_llm_status.setText(
+                f"LLM: ON ({short_mid})" if short_mid else "LLM: ON"
+            )
+        else:
+            act_llm_status.setText(f"LLM: {llm_label}")
 
     def _on_active(active: bool) -> None:
         tray_state["active"] = active
