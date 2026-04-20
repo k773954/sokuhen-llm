@@ -161,29 +161,17 @@ class LiveComposer:
         the user presses Enter mid-syllable and sees a stray "n" appear,
         then needs to press Enter again to commit it.
 
-        If an LLM rescorer is wired in (``self.rescorer``), runs a
-        rescoring pass here — commit time is the only phase where we
-        can afford the ~200 ms the default 110M-param model takes on
-        CPU. Its overrides are merged into ``self.state.overrides``
-        before the display_text is read, so the user sees the LLM-
-        preferred surface come out of the commit.
+        We intentionally do NOT run LLM rescoring here. The live
+        rescoring layer wired into ``_reconvert`` already keeps
+        ``self.state.overrides`` up-to-date with the LLM's preferred
+        surface as the user types, so commit is fast (< 1 ms). If the
+        user hits Enter before the background rescore finishes for the
+        very latest keystroke, they'll get the Viterbi result for that
+        edge -- a micro-second visual loss, but the hook stays snappy
+        and under Windows' LowLevelHooksTimeout no matter what.
         """
         # Resolve any trailing romaji before reading display_text.
         self._flush_pending()
-
-        # Apply LLM rescoring, if a rescorer is installed.
-        if self.rescorer is not None and self.state.result is not None:
-            try:
-                out = self.rescorer.rescore(
-                    frozen_prefix=self.state.frozen_surface,
-                    result=self.state.result,
-                    initial_overrides=self.state.overrides,
-                )
-                self.state.overrides = out.overrides
-            except Exception as e:
-                # LLM must never break commit. Log and proceed.
-                import logging
-                logging.getLogger(__name__).warning("rescore failed: %s", e)
 
         text = self.state.display_text
         self._observe_commit()
@@ -456,11 +444,21 @@ class LiveComposer:
     # --- internals -------------------------------------------------------
 
     def _reconvert(self) -> None:
-        """Re-run conversion on the live window after a state change."""
+        """Re-run conversion on the live window after a state change.
+
+        After setting ``self.state.result``, this also fires
+        ``self.on_reconverted`` if it's set. sokuhen-llm's ImeCore
+        registers a callback there to schedule background LLM
+        rescoring on the new reading (debounced, async, so the hot
+        keystroke path stays fast).
+        """
         if not self.state.kana_buffer:
             self.state.result = None
             self.state.overrides = {}
             self.state.selected_segment = 0
+            cb = getattr(self, "on_reconverted", None)
+            if cb is not None:
+                cb()
             return
         # Use the last frozen surface as BOS so the first segment sees a
         # realistic left context in the LM's bigram lookup.
@@ -479,6 +477,9 @@ class LiveComposer:
         # tends to focus the trailing 文節 as you type.
         if self.state.result.segments:
             self.state.selected_segment = len(self.state.result.segments) - 1
+        cb = getattr(self, "on_reconverted", None)
+        if cb is not None:
+            cb()
 
     def _maybe_bake(self) -> None:
         """Bake early segments into frozen_surface when the buffer outgrows

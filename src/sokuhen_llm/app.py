@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from .engine import Converter, Dictionary, LearningStore, LiveComposer
 from .input import HookEvent, KeyboardHook, Modifiers, send_unicode_text
+from .input._win32 import _os_ime_state_with_source
 from .input.hook import (
     VK_BACK,
     VK_DBE_ALPHANUMERIC,
@@ -88,6 +89,10 @@ class ImeCore(QObject):
     # ("loading" -> "ready" / "failed" / etc). Carries the new status
     # string so the UI can update the chip.
     llm_status_changed = pyqtSignal(str)
+    # Internal: worker thread -> main thread hop for live rescoring.
+    # Carries (generation_token, overrides_dict). See
+    # ``_schedule_live_rescore`` / ``_apply_live_rescore``.
+    _live_rescore_done = pyqtSignal(int, object)
 
     def __init__(self, composer: LiveComposer, learning: LearningStore) -> None:
         super().__init__()
@@ -101,24 +106,45 @@ class ImeCore(QObject):
         self._save_timer.setInterval(2_000)  # 2s of idle → flush
         self._save_timer.timeout.connect(self.learning.save)
 
-        # The user may have sokuhen-llm globally enabled but explicitly
-        # switched the OS IME to 英数字 mode via 半角/全角. Respect that
-        # intent: when the OS IME is off, sokuhen-llm also goes silent.
+        # OS IME state detection is two-track:
         #
-        # Detection is purely PASSIVE: we watch the keyboard hook for
-        # 半角/全角 (VK_KANJI), 英数 (VK_DBE_SBCSCHAR), and カタカナ/
-        # ひらがな (VK_DBE_DBCSCHAR) keydowns and flip our cached
-        # ``_os_ime_open`` accordingly. See _note_os_ime_toggle_key.
+        #  1. Hook-observed toggle keys (_note_os_ime_toggle_key).
+        #     Zero-lag, catches VK_KANJI (半角/全角), VK_IME_ON /
+        #     VK_IME_OFF, all VK_DBE_* variants, and VK_NONCONVERT.
         #
-        # We used to also actively poll IMM32 (ImmGetOpenStatus /
-        # WM_IME_CONTROL). That turned out to have side effects:
-        # queries from another thread confused Microsoft IME into
-        # toggling its own state, producing an infinite 英数字 ⇄
-        # 日本語 flip-flop. Polling is disabled; the passive hook
-        # alone is reliable enough — the uncommon case of toggling
-        # via Language Bar / PowerToys is still recoverable via
-        # Alt+` to manually re-sync.
-        self._os_ime_open = True  # flipped by _note_os_ime_toggle_key
+        #  2. Passive WM_IME_CONTROL poll every 1.5 s
+        #     (_poll_os_ime_state). Catches the remaining cases --
+        #     custom IME shortcuts that don't hit any recognised VK
+        #     (e.g. Ctrl+Space / Ctrl+Shift to toggle on some MS-IME
+        #     configs), Language Bar clicks, and PowerToys mappings.
+        #
+        # The poll is WM_IME_CONTROL only. AttachThreadInput was
+        # tried earlier and caused an infinite 英数字 ⇄ 日本語
+        # flip-flop on Win11 (the attach/detach race confused the
+        # IME into toggling itself); pure WM_IME_CONTROL is passive
+        # and safe.
+        self._os_ime_open = True  # updated by both tracks
+        self._os_ime_poll_timer = QTimer()
+        self._os_ime_poll_timer.setInterval(1500)
+        self._os_ime_poll_timer.timeout.connect(self._poll_os_ime_state)
+        self._os_ime_poll_timer.start()
+
+        # --- Live LLM rescoring ---------------------------------------
+        # The LLM runs in the background after every keystroke (not just
+        # on commit) so the conversion the user sees IS the LLM's
+        # judgement. We coalesce rapid keystrokes with a debounce timer
+        # and use a generation token to discard stale results.
+        self._live_rescore_gen = 0
+        self._live_rescore_worker = None  # threading.Thread while in flight
+        self._live_rescore_debounce = QTimer()
+        self._live_rescore_debounce.setSingleShot(True)
+        self._live_rescore_debounce.setInterval(180)
+        self._live_rescore_debounce.timeout.connect(self._start_live_rescore)
+        self._last_rescore_key = (None, None)
+        # Cross-thread bridge: worker thread emits, main thread applies.
+        self._live_rescore_done.connect(self._apply_live_rescore)
+        # Register callback into the composer so _reconvert fires us.
+        self.composer.on_reconverted = self._schedule_live_rescore
 
     @property
     def effective_active(self) -> bool:
@@ -126,6 +152,105 @@ class ImeCore(QObject):
         OS IME is in Japanese mode. This is the state the UI displays
         and that key handling checks."""
         return self.composer.state.active and self._os_ime_open
+
+    # --- live LLM rescoring ---------------------------------------
+
+    def _schedule_live_rescore(self) -> None:
+        """Called from composer._reconvert after each Viterbi pass.
+        Queues a debounced LLM rescore on the current state. If the
+        reading hasn't actually changed (same kana_buffer +
+        frozen_surface), skip — no need to rescore the same sentence
+        repeatedly just because overrides changed.
+
+        Must stay O(1) and non-blocking: we're still inside the
+        keyboard hook callback here."""
+        state = self.composer.state
+        key = (state.kana_buffer, state.frozen_surface)
+        if key == self._last_rescore_key:
+            return
+        self._last_rescore_key = key
+        if state.result is None or state.is_empty:
+            return
+        rescorer = self.composer.rescorer
+        if rescorer is None or getattr(rescorer, "status", "") != "ready":
+            return
+        self._live_rescore_gen += 1
+        self._live_rescore_debounce.start()
+
+    def _start_live_rescore(self) -> None:
+        """Fire the background worker. Runs on Qt main thread from
+        the debounce timer."""
+        import threading
+
+        state = self.composer.state
+        if state.result is None or state.is_empty:
+            return
+        rescorer = self.composer.rescorer
+        if rescorer is None or getattr(rescorer, "status", "") != "ready":
+            return
+        gen = self._live_rescore_gen
+        frozen = state.frozen_surface
+        result = state.result
+        overrides = dict(state.overrides)
+
+        def worker() -> None:
+            try:
+                out = rescorer.rescore(frozen, result, overrides)
+            except Exception as e:
+                log.warning("[LLM] live rescore error: %s", e)
+                return
+            # Marshall back to Qt main thread.
+            self._live_rescore_done.emit(gen, out)
+
+        threading.Thread(target=worker, daemon=True, name="sokuhen-llm-rescore").start()
+
+    def _apply_live_rescore(self, gen: int, rescore_result: object) -> None:
+        """Runs on the Qt main thread. Applies the LLM's preferred
+        overrides iff the composer state hasn't moved on since we
+        scheduled this pass."""
+        if gen != self._live_rescore_gen:
+            return  # a newer rescore has been scheduled
+        state = self.composer.state
+        if state.result is None or state.is_empty:
+            return
+        # Key must still match — guards against "user kept typing
+        # while we were rescoring, new Viterbi result supersedes".
+        if (state.kana_buffer, state.frozen_surface) != self._last_rescore_key:
+            return
+        new_overrides = getattr(rescore_result, "overrides", None) or {}
+        hits = getattr(rescore_result, "llm_hits", 0)
+        if new_overrides == state.overrides:
+            return  # LLM agreed with Viterbi — nothing to redraw
+        state.overrides = dict(new_overrides)
+        if hits > 0:
+            self.llm_rescored.emit()
+        self.state_changed.emit()
+
+    def _poll_os_ime_state(self) -> None:
+        """Passive OS IME state poll (WM_IME_CONTROL, no
+        AttachThreadInput). Runs on the Qt main thread via the timer.
+
+        We only act on transitions that the keyboard-hook observer
+        missed: specifically, when the hook has us at 'closed' but
+        the OS reports 'open'. That covers the user-reported case of
+        toggling IME ON via a custom shortcut (not 半角/全角). The
+        opposite direction (hook says open, OS says closed) is
+        deliberately ignored because some foreground apps return a
+        false 'closed' reading for their own reasons (no IME
+        context, browser DevTools windows, etc.) and we don't want
+        to silently disable sokuhen-llm when the user is mid-typing.
+        """
+        try:
+            is_open, _source = _os_ime_state_with_source()
+        except Exception:
+            return
+        if is_open and not self._os_ime_open:
+            self._os_ime_open = True
+            log.info("OS IME re-opened (poll-detected)")
+            if not self.composer.state.is_empty:
+                self.composer.cancel()
+            self.active_changed.emit(self.effective_active)
+            self.state_changed.emit()
 
     # --- IME toggle ----------------------------------------------------
 
