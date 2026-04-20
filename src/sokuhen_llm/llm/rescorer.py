@@ -45,12 +45,28 @@ class RescoreConfig:
 
     # Log-prob delta required for LLM to override the Viterbi choice.
     # Lower = LLM more aggressive; higher = LLM more conservative.
-    score_threshold: float = 0.5
+    # At 1.5 nats the LLM needs to be ~4.5× more confident in the
+    # alternative before overriding — high enough that style-preference
+    # flips (観た vs 見た, ちがう vs 違う) stop drowning out the real
+    # wins (事故 vs 自己, 使用 vs しよう).
+    score_threshold: float = 1.5
 
     # Cap per-segment candidate consideration — the Viterbi candidate
     # list can be long for short readings, and we don't need to score
     # deep entries.
     max_candidates_per_segment: int = 4
+
+    # Viterbi-confidence gate: skip LLM rescoring entirely for a
+    # segment if the gap between the best and second-best candidate
+    # is at least this many units of dictionary cost. In practice
+    # Viterbi is right when the gap is large and we save a costly
+    # LLM forward pass per segment.
+    #
+    # Calibrated so that a 500-point gap (e.g., 2500 vs 3000) is
+    # treated as "confident enough". Tighter (100) = LLM sees more
+    # segments (slower + more flips); wider (2000) = LLM only sees
+    # near-tie segments (faster + fewer flips).
+    viterbi_confidence_gap: int = 500
 
     # Prefix prepended to the whole surface before scoring, useful for
     # domain priming (e.g. "ニュース記事: "). Empty by default.
@@ -103,12 +119,23 @@ class Rescorer:
         ]
         max_cands = self.config.max_candidates_per_segment
         threshold = self.config.score_threshold
+        confidence_gap = self.config.viterbi_confidence_gap
         prefix_prompt = self.config.prompt_prefix
         hits = 0
 
         for i, seg in enumerate(result.segments):
             n_cands = min(len(seg.candidates), max_cands)
             if n_cands <= 1:
+                continue
+            # Viterbi-confidence gate: if the top dictionary cost beats
+            # the runner-up by more than ``confidence_gap``, the
+            # dictionary is already decisive. Skipping the LLM here
+            # both speeds things up and prevents "style-preference"
+            # flips like 見た↔観た or 違う↔ちがう that are all equally
+            # valid but may deviate from the user's expected form.
+            cand0 = seg.candidates[0]
+            cand1 = seg.candidates[1]
+            if cand1.cost - cand0.cost >= confidence_gap:
                 continue
             best_idx = choices[i]
             best_score = _score_with_choice(
