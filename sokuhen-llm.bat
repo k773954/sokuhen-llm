@@ -100,18 +100,22 @@ if "!SOKUHEN_LLM_DISABLE!"=="1" (
     goto :skip_llm
 )
 
-echo [check] LLM dependencies ^(transformers, torch^)...
-!PY_CMD! -c "import transformers, torch" >nul 2>&1
+echo [check] LLM dependencies ^(transformers, torch, sentencepiece, protobuf, tiktoken^)...
+rem protobuf + tiktoken are needed by some tokenizers (including rinna/
+rem japanese-gpt2-small's T5/SentencePiece converter). sentencepiece is
+rem needed for the SentencePiece vocab itself. Import all five so a
+rem missing one triggers the install path.
+!PY_CMD! -c "import transformers, torch, sentencepiece, google.protobuf, tiktoken" >nul 2>&1
 if errorlevel 1 (
     echo [setup] Installing/repairing LLM dependencies ^(~1.5 GB, one-time^)...
-    !PY_CMD! -m pip install "transformers>=4.40" "torch>=2.2" sentencepiece accelerate
+    !PY_CMD! -m pip install "transformers>=4.40" "torch>=2.2" sentencepiece protobuf tiktoken accelerate
     if errorlevel 1 (
         echo [warn] LLM dependency install failed. Launching WITHOUT LLM
         echo        rescoring. Set SOKUHEN_LLM_DISABLE=1 to silence this.
         echo.
         goto :skip_llm
     )
-    !PY_CMD! -c "import transformers, torch" >nul 2>&1
+    !PY_CMD! -c "import transformers, torch, sentencepiece, google.protobuf, tiktoken" >nul 2>&1
     if errorlevel 1 (
         echo [warn] LLM deps still don't import after install. Launching
         echo        WITHOUT LLM rescoring.

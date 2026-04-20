@@ -46,10 +46,10 @@ if not defined DICT_OK (
 rem -- 3. LLM deps + model (skippable) ---------------------------
 if "!SOKUHEN_LLM_DISABLE!"=="1" goto :skip_llm
 echo [check] LLM dependencies...
-!PY_CMD! -c "import transformers, torch" >nul 2>&1
+!PY_CMD! -c "import transformers, torch, sentencepiece, google.protobuf, tiktoken" >nul 2>&1
 if errorlevel 1 (
     echo [setup] Installing LLM dependencies ^(~1.5 GB, one-time^)...
-    !PY_CMD! -m pip install "transformers>=4.40" "torch>=2.2" sentencepiece accelerate
+    !PY_CMD! -m pip install "transformers>=4.40" "torch>=2.2" sentencepiece protobuf tiktoken accelerate
     if errorlevel 1 (
         echo [warn] LLM deps failed to install. Continuing without LLM.
         goto :skip_llm

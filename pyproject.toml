@@ -35,10 +35,20 @@ dependencies = [
 # Local LLM rescoring layer. Adds ~1.5 GB to the environment
 # (torch + transformers + tokenizers). The model itself lands
 # in ./models/ after running download_model.
+#
+# protobuf + tiktoken are required by transformers' tokenizer
+# conversion path for several Japanese models (notably
+# rinna/japanese-gpt2-small, which ships a SentencePiece vocab
+# that transformers converts through the protobuf/tiktoken
+# intermediate). Having these pre-installed prevents the
+# "tiktoken is required to read a tiktoken file" error during
+# the first model load.
 llm = [
     "transformers>=4.40",
     "torch>=2.2",
     "sentencepiece>=0.2",
+    "protobuf>=4.25",
+    "tiktoken>=0.7",
     "accelerate>=0.30",
 ]
 
