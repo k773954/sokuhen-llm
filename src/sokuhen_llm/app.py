@@ -93,6 +93,9 @@ class ImeCore(QObject):
     # Carries (generation_token, overrides_dict). See
     # ``_schedule_live_rescore`` / ``_apply_live_rescore``.
     _live_rescore_done = pyqtSignal(int, object)
+    # Emitted when a live rescore pass starts / ends. The status
+    # indicator listens to animate the "LLM 思考中" dots.
+    llm_thinking_changed = pyqtSignal(bool)
 
     def __init__(self, composer: LiveComposer, learning: LearningStore) -> None:
         super().__init__()
@@ -193,12 +196,17 @@ class ImeCore(QObject):
         result = state.result
         overrides = dict(state.overrides)
 
+        # Signal the UI: "the LLM is thinking RIGHT NOW". The status
+        # chip flips its band to cool blue with rotating dots for the
+        # duration.
+        self.llm_thinking_changed.emit(True)
+
         def worker() -> None:
             try:
                 out = rescorer.rescore(frozen, result, overrides)
             except Exception as e:
                 log.warning("[LLM] live rescore error: %s", e)
-                return
+                out = None
             # Marshall back to Qt main thread.
             self._live_rescore_done.emit(gen, out)
 
@@ -208,6 +216,12 @@ class ImeCore(QObject):
         """Runs on the Qt main thread. Applies the LLM's preferred
         overrides iff the composer state hasn't moved on since we
         scheduled this pass."""
+        # Signal end of "LLM is thinking" animation unconditionally --
+        # even stale / errored results are a completion from the UI's
+        # perspective.
+        self.llm_thinking_changed.emit(False)
+        if rescore_result is None:
+            return
         if gen != self._live_rescore_gen:
             return  # a newer rescore has been scheduled
         state = self.composer.state
@@ -219,9 +233,26 @@ class ImeCore(QObject):
             return
         new_overrides = getattr(rescore_result, "overrides", None) or {}
         hits = getattr(rescore_result, "llm_hits", 0)
-        if new_overrides == state.overrides:
-            return  # LLM agreed with Viterbi — nothing to redraw
-        state.overrides = dict(new_overrides)
+        alt_result = getattr(rescore_result, "alt_result", None)
+
+        changed = False
+        if alt_result is not None:
+            # LLM picked a different segmentation (merged adjacent
+            # segments). Replace the composer's ConversionResult and
+            # reset overrides -- candidate indices are different
+            # across segmentations.
+            state.result = alt_result
+            state.overrides = {}
+            # Clamp selected_segment to the new segment count.
+            if state.selected_segment >= len(alt_result.segments):
+                state.selected_segment = max(0, len(alt_result.segments) - 1)
+            changed = True
+        elif new_overrides != state.overrides:
+            state.overrides = dict(new_overrides)
+            changed = True
+
+        if not changed:
+            return
         if hits > 0:
             self.llm_rescored.emit()
         self.state_changed.emit()
@@ -592,14 +623,16 @@ def _build_engine() -> tuple[ImeCore, Converter, LearningStore]:
     # Build the LLM rescorer. It's optional — if transformers / torch
     # aren't installed, or the user turned it off, we ship a
     # DummyBackend and commit is unchanged from classical sokuhen.
-    rescorer = _build_rescorer()
+    # We pass the dictionary in so the rescorer can evaluate
+    # alternative segmentations (merging adjacent segments).
+    rescorer = _build_rescorer(dictionary=d)
 
     composer = LiveComposer(converter, learning, rescorer=rescorer)
     core = ImeCore(composer, learning)
     return core, converter, learning
 
 
-def _build_rescorer():
+def _build_rescorer(dictionary=None):
     """Instantiate the LLM rescorer, or ``None`` if unavailable/disabled.
 
     We MUST NOT block startup for model load (15 s on CPU). We also
@@ -638,7 +671,7 @@ def _build_rescorer():
         return None
 
     model_id = os.environ.get("SOKUHEN_LLM_MODEL", "rinna/japanese-gpt2-small")
-    return _AsyncRescorer(model_id=model_id)
+    return _AsyncRescorer(model_id=model_id, dictionary=dictionary)
 
 
 class _AsyncRescorer:
@@ -671,7 +704,7 @@ class _AsyncRescorer:
     # more robust across Python and transformers versions.
     _FALLBACK_MODEL = "cyberagent/open-calm-small"
 
-    def __init__(self, model_id: str) -> None:
+    def __init__(self, model_id: str, dictionary=None) -> None:
         import threading
 
         self._model_id = model_id
@@ -681,6 +714,7 @@ class _AsyncRescorer:
         self._status_callback = None  # set by app.py after UI exists
         self._error_message = ""
         self._active_model_id = model_id
+        self._dictionary = dictionary  # passed into Rescorer on load
         self._thread = threading.Thread(target=self._load, daemon=True, name="sokuhen-llm-load")
         self._thread.start()
 
@@ -750,7 +784,11 @@ class _AsyncRescorer:
                     last_error = f"{model_id}: backend unavailable"
                     log.warning("[LLM] %s backend not available", label)
                     continue
-                self._real = Rescorer(backend)
+                # Pull the dictionary reference off the composer so
+                # the rescorer can look up merged-reading candidates
+                # for its segmentation-alternative pass. Stored
+                # during ``_build_engine``; None before that.
+                self._real = Rescorer(backend, dictionary=self._dictionary)
                 self._active_model_id = model_id
                 if i > 0:
                     log.info(
@@ -1191,10 +1229,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     def _on_llm_rescored() -> None:
         indicator.flash_rescored()
 
+    def _on_llm_thinking(thinking: bool) -> None:
+        indicator.set_thinking(thinking)
+
     core.state_changed.connect(_on_state_changed)
     core.active_changed.connect(_on_active_changed)
     core.llm_status_changed.connect(_on_llm_status_changed)
     core.llm_rescored.connect(_on_llm_rescored)
+    core.llm_thinking_changed.connect(_on_llm_thinking)
 
     # Wire the _AsyncRescorer background loader to the UI. The
     # rescorer calls our callback from a worker thread; we bounce it

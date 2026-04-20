@@ -32,6 +32,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
+from ..engine.dictionary import DictEntry, Dictionary
 from ..engine.viterbi import ConversionResult, ConversionSegment
 from .backend import Backend, DummyBackend
 
@@ -75,28 +76,60 @@ class RescoreConfig:
     # domain priming (e.g. "ニュース記事: "). Empty by default.
     prompt_prefix: str = ""
 
+    # Also try merging adjacent segments to see if a single-unit
+    # alternative scores higher. Captures segmentation errors the
+    # Viterbi made at the lattice-level (e.g., the Viterbi split
+    # "きのう" → き+のう where the merged 昨日 is obviously right).
+    # Costs one LLM score call per mergeable pair, so for N segments
+    # it's an extra O(N) calls on top of the within-segment pass.
+    try_segment_merges: bool = True
+
+    # When evaluating segment-merge alternatives, only consider
+    # dictionary entries for the merged reading with cost at most this
+    # much above the cheapest -- avoids paying LLM calls on a long
+    # tail of rare proper-noun compounds that will never beat the
+    # split.
+    merge_candidate_cost_limit: int = 1500
+
 
 @dataclass
 class RescoreResult:
     """Output of a rescoring pass. ``overrides`` maps segment index to
     the chosen candidate index inside that segment's candidate list.
-    Feed this into ComposerState.overrides to apply the rescoring."""
+    Feed this into ComposerState.overrides to apply the rescoring.
+
+    If ``alt_result`` is set, the rescorer decided a different
+    segmentation (produced by merging / splitting segments) is
+    preferable. Callers wanting a full segmentation switch should
+    honor ``alt_result`` in place of the original ConversionResult;
+    ``overrides`` then references the alt's candidates. When
+    ``alt_result`` is None, ``overrides`` continues to refer to the
+    original result."""
 
     overrides: dict[int, int] = field(default_factory=dict)
     surface: str = ""  # resulting surface after applying overrides
     llm_hits: int = 0  # how many segments the LLM changed
+    alt_result: Optional[ConversionResult] = None  # segmentation override
 
 
 class Rescorer:
-    """Re-rank candidates inside each ConversionSegment using LLM scores."""
+    """Re-rank candidates inside each ConversionSegment using LLM scores.
+
+    With ``dictionary`` supplied, also evaluates alternative
+    segmentations -- specifically, merging adjacent segments when a
+    single dictionary entry covers both readings. This catches
+    Viterbi lattice errors that within-segment rescoring can't fix.
+    """
 
     def __init__(
         self,
         backend: Optional[Backend] = None,
         config: Optional[RescoreConfig] = None,
+        dictionary: Optional[Dictionary] = None,
     ) -> None:
         self.backend: Backend = backend or DummyBackend()
         self.config = config or RescoreConfig()
+        self.dictionary = dictionary
 
     def rescore(
         self,
@@ -168,10 +201,120 @@ class Rescorer:
                 overrides[i] = best_idx
                 hits += 1
 
+        # Segmentation pass: try merging adjacent segments.
+        alt_result: Optional[ConversionResult] = None
+        if self.config.try_segment_merges and self.dictionary is not None:
+            alt_result, alt_hits = self._try_merges(
+                frozen_prefix=prefix_prompt + frozen_prefix,
+                result=result,
+                choices=choices,
+                threshold=threshold,
+            )
+            hits += alt_hits
+
         out.overrides = overrides
-        out.surface = result.surface_at(overrides)
+        out.surface = (alt_result or result).surface_at(overrides if alt_result is None else {})
         out.llm_hits = hits
+        out.alt_result = alt_result
         return out
+
+    def _try_merges(
+        self,
+        frozen_prefix: str,
+        result: ConversionResult,
+        choices: list[int],
+        threshold: float,
+    ) -> tuple[Optional[ConversionResult], int]:
+        """Probe each adjacent pair (i, i+1) for a dictionary entry
+        covering both readings. If LLM prefers the merged form over
+        the split one by at least ``threshold`` nats, apply it.
+
+        Returns (alt_result | None, hits). ``alt_result`` replaces the
+        whole ConversionResult when segmentation changed; callers need
+        to propagate it into the composer. Multiple merges compound:
+        each accepted merge updates the working result and the loop
+        continues from there. We do NOT iterate past a single
+        left-to-right pass.
+        """
+        assert self.dictionary is not None
+        segments = list(result.segments)
+        if len(segments) < 2:
+            return None, 0
+
+        def _current_surface(segs: list[ConversionSegment], sel: list[int]) -> str:
+            parts = []
+            for i, s in enumerate(segs):
+                k = sel[i] if i < len(sel) else 0
+                if 0 <= k < len(s.candidates):
+                    parts.append(s.candidates[k].surface)
+                else:
+                    parts.append(s.surface)
+            return "".join(parts)
+
+        cur_surface = _current_surface(segments, choices)
+        base_score = self.backend.score(frozen_prefix + cur_surface)
+
+        cost_limit = self.config.merge_candidate_cost_limit
+        merges_applied = 0
+        i = 0
+        while i < len(segments) - 1:
+            seg_a = segments[i]
+            seg_b = segments[i + 1]
+            merged_reading = seg_a.reading + seg_b.reading
+            entries = sorted(
+                self.dictionary.lookup(merged_reading),
+                key=lambda e: e.cost,
+            )
+            if not entries:
+                i += 1
+                continue
+            cheapest = entries[0].cost
+            candidates_to_try = [
+                e for e in entries if e.cost <= cheapest + cost_limit
+            ][: self.config.max_candidates_per_segment]
+            if not candidates_to_try:
+                i += 1
+                continue
+
+            best_entry: Optional[DictEntry] = None
+            best_score = base_score
+            for entry in candidates_to_try:
+                # Build the alternate surface: segments[:i] + [merged]
+                # + segments[i+2:], with the merged slot showing
+                # `entry.surface`.
+                pre = _current_surface(segments[:i], choices[:i])
+                post = _current_surface(segments[i + 2:], choices[i + 2:])
+                alt_surface = pre + entry.surface + post
+                s = self.backend.score(frozen_prefix + alt_surface)
+                if s - best_score >= threshold and s > best_score:
+                    best_score = s
+                    best_entry = entry
+
+            if best_entry is None:
+                i += 1
+                continue
+
+            # Accept the merge. Build a new ConversionSegment and
+            # splice it into ``segments``.
+            merged_seg = ConversionSegment(
+                start=seg_a.start,
+                end=seg_b.end,
+                reading=merged_reading,
+                surface=best_entry.surface,
+                candidates=candidates_to_try,
+            )
+            segments = segments[:i] + [merged_seg] + segments[i + 2:]
+            choices = choices[:i] + [0] + choices[i + 2:]
+            cur_surface = _current_surface(segments, choices)
+            base_score = best_score
+            merges_applied += 1
+            # Don't advance i -- another merge may now apply at the
+            # same position (three-segment collapses).
+
+        if merges_applied == 0:
+            return None, 0
+        new_result = ConversionResult(reading=result.reading, segments=segments)
+        return new_result, merges_applied
 
 
 def _score_with_choice(
