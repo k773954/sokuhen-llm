@@ -421,30 +421,87 @@ def _build_engine() -> tuple[ImeCore, Converter, LearningStore]:
 def _build_rescorer():
     """Instantiate the LLM rescorer, or ``None`` if unavailable/disabled.
 
-    Disabling knobs, in order:
-      * env ``SOKUHEN_LLM_DISABLE=1`` forces skip (useful for --selftest
-        and for users who installed without transformers).
-      * missing transformers/torch or a backend-load failure falls
-        through silently.
+    Loading the LLM weights takes 5-15 s on CPU and we don't want to
+    block startup that long. We return a lazy wrapper that defers
+    backend instantiation until the first ``rescore()`` call. The first
+    Enter press after launch pays the warmup cost; every subsequent
+    commit is fast.
+
+    Disabling knobs:
+      * ``SOKUHEN_LLM_DISABLE=1`` skip entirely (same as no LLM deps)
+      * ``SOKUHEN_LLM_MODEL=<hf-id>`` switch model
     """
     import os
 
     if os.environ.get("SOKUHEN_LLM_DISABLE") == "1":
         log.info("LLM rescoring disabled via SOKUHEN_LLM_DISABLE")
         return None
-    try:
-        from .llm.hf_backend import HFBackend
-        from .llm.rescorer import Rescorer
 
-        model_id = os.environ.get("SOKUHEN_LLM_MODEL", "rinna/japanese-gpt2-small")
-        backend = HFBackend(model_id=model_id)
-        if not backend.available:
-            log.info("LLM rescoring unavailable (backend not loaded); continuing without it")
-            return None
-        return Rescorer(backend)
-    except Exception as e:
-        log.warning("LLM rescorer init failed: %s", e)
+    # Quick pre-check: if transformers/torch aren't importable, bail
+    # now so we don't promise a Rescorer we can't fulfil.
+    try:
+        import torch  # noqa: F401
+        import transformers  # noqa: F401
+    except ImportError:
+        log.info("LLM rescoring unavailable (transformers / torch not installed)")
         return None
+
+    from .llm.rescorer import Rescorer
+
+    model_id = os.environ.get("SOKUHEN_LLM_MODEL", "rinna/japanese-gpt2-small")
+    return _LazyRescorer(model_id=model_id)
+
+
+class _LazyRescorer:
+    """Drop-in replacement for ``Rescorer`` that defers the expensive
+    ``HFBackend`` construction until the first ``rescore()`` call.
+
+    Duck-types the ``rescore(frozen_prefix, result, initial_overrides)``
+    method that LiveComposer calls. On the first call, it instantiates
+    an ``HFBackend`` (loads the model weights), wraps it in a real
+    ``Rescorer``, and delegates. Subsequent calls go straight to the
+    cached real rescorer.
+
+    If model loading fails, we log once and become a no-op (return
+    the Viterbi result unchanged) so the IME still works.
+    """
+
+    def __init__(self, model_id: str) -> None:
+        self._model_id = model_id
+        self._real = None  # Rescorer, or sentinel-false on failure
+        self._tried = False
+
+    def _ensure_real(self):
+        if self._tried:
+            return self._real
+        self._tried = True
+        try:
+            from .llm.hf_backend import HFBackend
+            from .llm.rescorer import Rescorer
+            log.info("Lazy-loading LLM (%s)...", self._model_id)
+            backend = HFBackend(model_id=self._model_id)
+            if not backend.available:
+                log.info("LLM backend not available; rescoring disabled")
+                return None
+            self._real = Rescorer(backend)
+            log.info("LLM ready -- rescoring active from next commit")
+            return self._real
+        except Exception as e:
+            log.warning("LLM lazy-load failed: %s -- rescoring disabled", e)
+            return None
+
+    def rescore(self, frozen_prefix, result, initial_overrides=None):
+        real = self._ensure_real()
+        if real is None:
+            # Graceful fallthrough: return a zero-override RescoreResult
+            # shaped like what LiveComposer expects.
+            from .llm.rescorer import RescoreResult
+            return RescoreResult(
+                overrides=dict(initial_overrides or {}),
+                surface=result.surface_at(initial_overrides or {}),
+                llm_hits=0,
+            )
+        return real.rescore(frozen_prefix, result, initial_overrides)
 
 
 def _make_tray_icon(active: bool) -> QIcon:
