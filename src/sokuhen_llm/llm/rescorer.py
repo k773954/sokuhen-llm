@@ -180,21 +180,25 @@ class Rescorer:
                 cand1 = seg.candidates[1]
                 if cand1.cost - cand0.cost >= confidence_gap:
                     continue
+            # Build all K candidate surfaces at once and score them
+            # in a single forward pass. This is the main CPU-speed
+            # win: the tokenize + model forward is paid once per
+            # segment instead of K times.
+            prefix_full = prefix_prompt + frozen_prefix
+            candidate_surfaces = [
+                _build_surface(prefix_full, result.segments, choices, i, k)
+                for k in range(n_cands)
+            ]
+            scores = self.backend.score_batch(candidate_surfaces)
+
             best_idx = choices[i]
-            best_score = _score_with_choice(
-                self.backend, prefix_prompt + frozen_prefix, result.segments,
-                choices, i, best_idx,
-            )
+            best_score = scores[best_idx] if best_idx < len(scores) else float("-inf")
             original_score = best_score
             for k in range(n_cands):
                 if k == choices[i]:
                     continue
-                s = _score_with_choice(
-                    self.backend, prefix_prompt + frozen_prefix, result.segments,
-                    choices, i, k,
-                )
-                if s > best_score:
-                    best_score = s
+                if scores[k] > best_score:
+                    best_score = scores[k]
                     best_idx = k
             if best_idx != choices[i] and (best_score - original_score) >= threshold:
                 choices[i] = best_idx
@@ -276,17 +280,21 @@ class Rescorer:
                 i += 1
                 continue
 
+            # Batch-score the whole set of merge candidates in one
+            # forward pass. Same motivation as the within-segment
+            # loop: one tokenize+forward vs N of them.
+            pre = _current_surface(segments[:i], choices[:i])
+            post = _current_surface(segments[i + 2:], choices[i + 2:])
+            merge_surfaces = [
+                frozen_prefix + pre + entry.surface + post
+                for entry in candidates_to_try
+            ]
+            merge_scores = self.backend.score_batch(merge_surfaces)
+
             best_entry: Optional[DictEntry] = None
             best_score = base_score
-            for entry in candidates_to_try:
-                # Build the alternate surface: segments[:i] + [merged]
-                # + segments[i+2:], with the merged slot showing
-                # `entry.surface`.
-                pre = _current_surface(segments[:i], choices[:i])
-                post = _current_surface(segments[i + 2:], choices[i + 2:])
-                alt_surface = pre + entry.surface + post
-                s = self.backend.score(frozen_prefix + alt_surface)
-                if s - best_score >= threshold and s > best_score:
+            for entry, s in zip(candidates_to_try, merge_scores):
+                if s - base_score >= threshold and s > best_score:
                     best_score = s
                     best_entry = entry
 
@@ -315,6 +323,30 @@ class Rescorer:
             return None, 0
         new_result = ConversionResult(reading=result.reading, segments=segments)
         return new_result, merges_applied
+
+
+def _build_surface(
+    prefix: str,
+    segments: list[ConversionSegment],
+    choices: list[int],
+    target_idx: int,
+    target_choice: int,
+) -> str:
+    """Return prefix + concatenated segment surfaces, with
+    segment[target_idx] swapped to its target_choice candidate.
+    Shared helper used by both the batched and the legacy
+    single-score paths."""
+    parts: list[str] = []
+    for i, seg in enumerate(segments):
+        if i == target_idx:
+            k = target_choice
+        else:
+            k = choices[i]
+        if 0 <= k < len(seg.candidates):
+            parts.append(seg.candidates[k].surface)
+        else:
+            parts.append(seg.surface)
+    return prefix + "".join(parts)
 
 
 def _score_with_choice(

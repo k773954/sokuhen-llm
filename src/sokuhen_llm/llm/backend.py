@@ -38,6 +38,16 @@ class Backend(Protocol):
         """
         ...
 
+    def score_batch(self, texts: list[str]) -> list[float]:
+        """Batched variant of ``score``. Returns one score per input.
+
+        The default rescorer uses this path when scoring K
+        alternatives for a segment -- it's the main CPU-speed win.
+        Implementations without a natural batch path can fall back
+        to calling ``score`` in a loop (see DummyBackend below).
+        """
+        ...
+
     @property
     def available(self) -> bool:
         """True if this backend is usable. A ``DummyBackend`` returns
@@ -61,3 +71,6 @@ class DummyBackend:
 
     def score(self, text: str) -> float:  # noqa: ARG002
         return 0.0
+
+    def score_batch(self, texts: list[str]) -> list[float]:
+        return [0.0 for _ in texts]
