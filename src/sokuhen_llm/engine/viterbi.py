@@ -109,6 +109,20 @@ _FOREIGN_DIGRAPHS = frozenset([
     "くぉ",
 ])
 
+# Handakuten ("pa-row": ぱぴぷぺぽ) is almost exclusive to loanwords in
+# modern Japanese, with a few native-onomatopoeia exceptions (ぱくぱく,
+# ぽっと). When a run contains at least one handakuten char AND a
+# small-tsu + hard-consonant cluster like っく / っぷ / っと, we treat it
+# as foreign. This catches パブリック (ぱぶりっく), ストップ (すとっぷ),
+# ポケット (ぽけっと), ピック (ぴっく), etc. that don't trigger any
+# _FOREIGN_DIGRAPHS entry on their own.
+_HANDAKUTEN_CHARS = frozenset("ぱぴぷぺぽ")
+_FOREIGN_SOKUON_PAIRS = frozenset([
+    "っく", "っぷ", "っと", "っち", "っす", "っき", "っか",
+    "っぽ", "っぴ", "っぺ", "っぱ", "っけ", "っこ",
+    "っぶ", "っぐ", "っず", "っじ", "っで", "っだ",
+])
+
 # Any hiragana char that could plausibly be part of a katakana loanword.
 # Used to define the bounds of the "foreign run" once we've decided a run
 # is foreign.
@@ -122,7 +136,11 @@ _KATAKANA_CAPABLE = (
 # Common single-character Japanese particles. Hitting any of these ends
 # the katakana run — a particle after a foreign word marks the word's
 # boundary ("コーヒー" + "を" + "飲む").
-_PARTICLE_BREAKS = frozenset("をのにはがともやへかよねわでんぞぜばぎくけ")
+#
+# Keep this tight -- only real particles. Earlier versions included
+# く / け / ぎ / ぞ / ぜ, which broke loanwords that contain them
+# mid-word (ポケット had its run cut at け, スケート at ケ).
+_PARTICLE_BREAKS = frozenset("をのにはがともやへかよねわでん")
 
 
 _MAX_FOREIGN_RUN = 6  # cap the scan distance — longer runs likely span words
@@ -151,13 +169,12 @@ def _foreign_run(reading: str, start: int) -> int:
     if reading[start] not in _KATAKANA_CAPABLE:
         return start
 
-    # First pass: scan forward looking for a foreign signal (ー or
-    # foreign digraph) within the search cap. Stop at particle breaks —
-    # "の" between two words (首位のチーム) means the run shouldn't
-    # bridge the particle, and the cost of missing mid-word に in
-    # モニター is acceptable (we rely on the kata-dict extraction
-    # from SKK-JISYO.L for that; モニター is explicitly registered).
+    # First pass: scan forward looking for a foreign signal (ー,
+    # foreign digraph, or handakuten-plus-sokuon-pair) within the
+    # search cap. Stop at particle breaks — "の" between two words
+    # (首位のチーム) means the run shouldn't bridge the particle.
     signal_end = -1
+    saw_handakuten = False
     limit = min(n, start + _MAX_FOREIGN_RUN)
     k = start
     while k < limit:
@@ -165,24 +182,46 @@ def _foreign_run(reading: str, start: int) -> int:
         if c not in _KATAKANA_CAPABLE:
             break
         if k > start and c in _PARTICLE_BREAKS:
-            break
+            # Particle-char lookahead: if the next char is a small
+            # kana (っ / ゃ / ゅ / ょ / small vowel), we're almost
+            # certainly mid-loanword (ストップ, トッピング), NOT at
+            # a particle boundary. In that case don't break.
+            nxt = reading[k + 1] if k + 1 < n else ""
+            if nxt in "っゃゅょぁぃぅぇぉ":
+                pass  # keep scanning
+            else:
+                break
+        if c in _HANDAKUTEN_CHARS:
+            saw_handakuten = True
         if c in _STRONG_FOREIGN:
             signal_end = k + 1
             break
-        if k + 1 < limit and reading[k : k + 2] in _FOREIGN_DIGRAPHS:
-            signal_end = k + 2
-            break
+        if k + 1 < limit:
+            pair = reading[k : k + 2]
+            if pair in _FOREIGN_DIGRAPHS:
+                signal_end = k + 2
+                break
+            # (Previously tried: "sokuon-pair + handakuten anywhere
+            # in the run" as a foreign signal. That turned out to
+            # over-trigger on native words like やっぱり and
+            # はっぴょう, which also have the pattern. Reverted to
+            # explicit loanword entries instead.)
         k += 1
 
     if signal_end < 0:
         return start  # no foreign signal
 
-    # Second pass: extend from signal_end until a particle break or a
-    # non-katakana-capable char. The signal's presence confirms we're
-    # inside a foreign word, so a particle char after the signal is the
-    # natural word boundary (コーヒー + を, モニター + が).
+    # Second pass: extend from signal_end until a particle break, a
+    # non-katakana-capable char, OR a hard cap of 2 characters past
+    # the signal. Most loanwords end ON the signal char (ー, ぃ, ぇ)
+    # so the extension only needs to cover a trailing consonant+vowel
+    # pair. Any more than that and we risk greedily swallowing a
+    # following native word -- "セキュリティ対策" used to produce
+    # "セキュリティタイサク" because the run kept extending past
+    # てぃ into たいさく.
     end = signal_end
-    while end < n:
+    max_extend = min(n, signal_end + 2)
+    while end < max_extend:
         c = reading[end]
         if c not in _KATAKANA_CAPABLE:
             break

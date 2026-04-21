@@ -34,10 +34,19 @@ from .romaji import RomajiConverter
 from .viterbi import ConversionResult, Converter
 
 
-# Default live window size (hiragana chars). Large enough to hold a full
-# short sentence without ever baking, so typical input never gets the
-# "前のほうの変換が再度行われて変になる" problem the user hit.
-WINDOW_KANA = 32
+# Default live window size (hiragana chars). Large enough to hold a
+# typical full paragraph without ever baking, so the LLM rescorer
+# continues to re-evaluate the entire composition on every
+# keystroke -- "once-confirmed" text can still be reconsidered in
+# light of newly typed context, which matches the user expectation
+# that ``一度変換を確定したもの`` should still be re-verified until
+# the user commits for real with Enter.
+#
+# At 128 kana Viterbi is still sub-millisecond and the LLM batched
+# pass handles a ~10-segment composition in ~200 ms. We keep
+# BAKE_HYSTERESIS at the old value so the eventual bake (for very
+# long inputs) still waits for a clean-enough boundary.
+WINDOW_KANA = 128
 
 # Bake hysteresis: only start baking when the buffer exceeds window by
 # this much. Prevents single-kana trickle-baking at bad boundaries.

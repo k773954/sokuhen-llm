@@ -205,16 +205,40 @@ class Rescorer:
                 overrides[i] = best_idx
                 hits += 1
 
-        # Segmentation pass: try merging adjacent segments.
+        # Segmentation pass: generate alternative segmentations and
+        # let the LLM pick the best one. Two strategies stacked:
+        #   (a) merging adjacent segments (_try_merges)
+        #   (b) shifting the boundary between adjacent segments ±1 or
+        #       ±2 chars so the LLM also sees near-miss splits where
+        #       Viterbi's dictionary-cost picked a wrong boundary
+        #       (_try_boundary_shifts).
         alt_result: Optional[ConversionResult] = None
         if self.config.try_segment_merges and self.dictionary is not None:
-            alt_result, alt_hits = self._try_merges(
+            working = result
+            alt_result_merges, alt_hits_merges = self._try_merges(
                 frozen_prefix=prefix_prompt + frozen_prefix,
-                result=result,
+                result=working,
                 choices=choices,
                 threshold=threshold,
             )
-            hits += alt_hits
+            hits += alt_hits_merges
+            if alt_result_merges is not None:
+                working = alt_result_merges
+                # Merges dropped overrides; start from [0]*N for the
+                # shift pass.
+                choices = [0] * len(working.segments)
+
+            alt_result_shift, alt_hits_shift = self._try_boundary_shifts(
+                frozen_prefix=prefix_prompt + frozen_prefix,
+                result=working,
+                choices=choices,
+                threshold=threshold,
+            )
+            hits += alt_hits_shift
+            if alt_result_shift is not None:
+                alt_result = alt_result_shift
+            elif alt_result_merges is not None:
+                alt_result = alt_result_merges
 
         out.overrides = overrides
         out.surface = (alt_result or result).surface_at(overrides if alt_result is None else {})
@@ -323,6 +347,143 @@ class Rescorer:
             return None, 0
         new_result = ConversionResult(reading=result.reading, segments=segments)
         return new_result, merges_applied
+
+    def _try_boundary_shifts(
+        self,
+        frozen_prefix: str,
+        result: ConversionResult,
+        choices: list[int],
+        threshold: float,
+    ) -> tuple[Optional[ConversionResult], int]:
+        """For each adjacent pair of segments, try shifting the
+        boundary between them by 1 or 2 reading-characters in either
+        direction. If the shifted segmentation has valid dictionary
+        entries for both halves AND the LLM scores the resulting
+        surface higher than the current segmentation by ≥ threshold
+        nats, adopt the shift.
+
+        Complements _try_merges: merges consider the union of two
+        segments as one unit; shifts consider two segments of
+        different widths. Together they give LLM visibility into the
+        main classes of Viterbi mis-splits.
+
+        Accepts at most one shift per pair per pass -- compounding
+        shifts across the sentence would blow up candidate count.
+        """
+        assert self.dictionary is not None
+        if len(result.segments) < 2:
+            return None, 0
+
+        segments = list(result.segments)
+        max_cands = self.config.max_candidates_per_segment
+
+        # Helper to build the full current surface with the given
+        # segments + choices.
+        def _full_surface(segs: list[ConversionSegment], sel: list[int]) -> str:
+            parts = []
+            for idx, s in enumerate(segs):
+                k = sel[idx] if idx < len(sel) else 0
+                if 0 <= k < len(s.candidates):
+                    parts.append(s.candidates[k].surface)
+                else:
+                    parts.append(s.surface)
+            return "".join(parts)
+
+        base_score = self.backend.score(frozen_prefix + _full_surface(segments, choices))
+        shifts_applied = 0
+        i = 0
+        while i < len(segments) - 1:
+            seg_a = segments[i]
+            seg_b = segments[i + 1]
+            combined = seg_a.reading + seg_b.reading
+            n = len(combined)
+            if n < 2:
+                i += 1
+                continue
+            # Current boundary position within ``combined``.
+            cur_split = len(seg_a.reading)
+            # Candidate split positions: one or two chars either side
+            # of the current split, clipped into [1, n-1].
+            cand_splits = sorted({
+                p for p in (cur_split - 2, cur_split - 1,
+                             cur_split + 1, cur_split + 2)
+                if 1 <= p <= n - 1
+            })
+            if not cand_splits:
+                i += 1
+                continue
+
+            # Build batch of (alt_surface, new_seg_a_entry, new_seg_b_entry, split_pos)
+            batch_items = []
+            for split_pos in cand_splits:
+                left_reading = combined[:split_pos]
+                right_reading = combined[split_pos:]
+                left_entries = sorted(
+                    self.dictionary.lookup(left_reading),
+                    key=lambda e: e.cost,
+                )[:max_cands]
+                right_entries = sorted(
+                    self.dictionary.lookup(right_reading),
+                    key=lambda e: e.cost,
+                )[:max_cands]
+                if not left_entries or not right_entries:
+                    continue
+                # Only try the top entry of each side for the shift
+                # itself -- extra-candidate rescoring is done by the
+                # within-segment pass on the winning shift.
+                le = left_entries[0]
+                re = right_entries[0]
+                pre = _full_surface(segments[:i], choices[:i])
+                post = _full_surface(segments[i + 2:], choices[i + 2:])
+                alt_surface = pre + le.surface + re.surface + post
+                batch_items.append((alt_surface, le, re, split_pos,
+                                    left_entries, right_entries))
+
+            if not batch_items:
+                i += 1
+                continue
+
+            surfaces = [frozen_prefix + b[0] for b in batch_items]
+            scores = self.backend.score_batch(surfaces)
+
+            best_item = None
+            best_score = base_score
+            for item, s in zip(batch_items, scores):
+                if s - base_score >= threshold and s > best_score:
+                    best_score = s
+                    best_item = item
+
+            if best_item is None:
+                i += 1
+                continue
+
+            _alt_surf, le, re, split_pos, left_ents, right_ents = best_item
+            new_a = ConversionSegment(
+                start=seg_a.start,
+                end=seg_a.start + split_pos,
+                reading=combined[:split_pos],
+                surface=le.surface,
+                candidates=left_ents,
+            )
+            new_b = ConversionSegment(
+                start=seg_a.start + split_pos,
+                end=seg_b.end,
+                reading=combined[split_pos:],
+                surface=re.surface,
+                candidates=right_ents,
+            )
+            segments = segments[:i] + [new_a, new_b] + segments[i + 2:]
+            choices = choices[:i] + [0, 0] + choices[i + 2:]
+            base_score = best_score
+            shifts_applied += 1
+            i += 1  # don't re-test the same pair
+
+        if shifts_applied == 0:
+            return None, 0
+        return (
+            ConversionResult(reading=result.reading, segments=segments),
+            shifts_applied,
+        )
 
 
 def _build_surface(
