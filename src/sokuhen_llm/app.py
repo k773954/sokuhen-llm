@@ -168,6 +168,12 @@ class ImeCore(QObject):
         Must stay O(1) and non-blocking: we're still inside the
         keyboard hook callback here."""
         state = self.composer.state
+        # Respect a manual edit: once the user cycled with Space or
+        # resized with Shift+Arrow, don't let the LLM run again on
+        # this composition. Fresh typing clears the flag via
+        # _reconvert.
+        if state.manually_edited:
+            return
         key = (state.kana_buffer, state.frozen_surface)
         if key == self._last_rescore_key:
             return
@@ -230,6 +236,12 @@ class ImeCore(QObject):
         # Key must still match — guards against "user kept typing
         # while we were rescoring, new Viterbi result supersedes".
         if (state.kana_buffer, state.frozen_surface) != self._last_rescore_key:
+            return
+        # If the user manually edited while we were rescoring, their
+        # choice is authoritative -- do NOT overwrite it with LLM's
+        # preference, even if this rescore pass was scheduled before
+        # the Space press.
+        if state.manually_edited:
             return
         new_overrides = getattr(rescore_result, "overrides", None) or {}
         hits = getattr(rescore_result, "llm_hits", 0)
@@ -509,6 +521,14 @@ class ImeCore(QObject):
     def _commit(self) -> bool:
         """Commit the in-flight composition synchronously.
 
+        If the composer is in ``manually_edited`` mode (user just
+        cycled candidates with Space or resized with Shift+Arrow),
+        the first Enter consumes the key and clears the edit flag
+        instead of committing. That's a deliberate confirmation step
+        so a reflexive Enter doesn't commit the wrong variant that
+        happened to be under the cursor. A second Enter goes through
+        the normal commit path.
+
         The big reliability footgun here is Windows'
         ``LowLevelHooksTimeout`` (default 300 ms): if our hook
         callback exceeds it even once, the OS silently unhooks us and
@@ -532,6 +552,13 @@ class ImeCore(QObject):
         """
         if self.composer.state.is_empty:
             return False
+        if self.composer.state.manually_edited:
+            # First Enter after a manual edit: acknowledge + arm.
+            # The user still sees their composition; pressing Enter
+            # again commits it (manually_edited is now False).
+            self.composer.state.manually_edited = False
+            self.state_changed.emit()
+            return True
         text = self.composer.commit()
         llm_fired = (
             getattr(self.composer, "rescorer", None) is not None

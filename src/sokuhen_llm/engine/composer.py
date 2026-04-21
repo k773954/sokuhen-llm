@@ -83,6 +83,19 @@ class ComposerState:
     # alternative. The UI reads this to decide whether to render the
     # candidate list panel below the composition line.
     show_candidates: bool = False
+    # True once the user has manually picked a candidate (Space) or
+    # resized a segment (Shift+Arrow). Two effects:
+    #   1. LLM rescoring is suspended while this flag is set, so the
+    #      LLM can never silently overwrite the user's deliberate
+    #      choice.
+    #   2. The first Enter absorbs-but-doesn't-commit as an explicit
+    #      confirmation step; a second Enter actually commits. This
+    #      prevents "I pressed Space 3 times to pick the right one,
+    #      then Enter to confirm the PICK, but it committed with the
+    #      wrong one instead" style mishaps.
+    # Reset by any new romaji input, by cancel(), or by the
+    # confirmation Enter itself.
+    manually_edited: bool = False
 
     # --- computed views ---------------------------------------------------
 
@@ -265,6 +278,9 @@ class LiveComposer:
         Also marks the state as "candidate list visible" so the UI panel
         opens on the first Space / arrow key. Subsequent presses keep
         cycling within the list.
+
+        Sets ``manually_edited`` so the background LLM rescorer stops
+        overriding, and the next Enter needs an explicit confirm.
         """
         if self.state.result is None or not self.state.result.segments:
             return
@@ -274,6 +290,7 @@ class LiveComposer:
         new = (cur + delta) % max(1, len(seg.candidates))
         self.state.overrides[idx] = new
         self.state.show_candidates = True
+        self.state.manually_edited = True
 
     def hide_candidates(self) -> None:
         self.state.show_candidates = False
@@ -367,6 +384,7 @@ class LiveComposer:
         # Keep selection on the resized segment, clamped.
         self.state.selected_segment = min(idx, len(self.state.result.segments) - 1)
         self.state.show_candidates = False
+        self.state.manually_edited = True
 
     def _flush_pending(self) -> None:
         """Resolve pending romaji into the kana buffer. 'n'/'nn' become ん,
@@ -451,7 +469,11 @@ class LiveComposer:
         registers a callback there to schedule background LLM
         rescoring on the new reading (debounced, async, so the hot
         keystroke path stays fast).
+
+        Any fresh typing invalidates the ``manually_edited`` state --
+        the user moved on and LLM rescoring should resume.
         """
+        self.state.manually_edited = False
         if not self.state.kana_buffer:
             self.state.result = None
             self.state.overrides = {}
