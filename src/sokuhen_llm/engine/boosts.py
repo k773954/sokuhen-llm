@@ -1726,6 +1726,28 @@ EXTRA_WORDS: list[tuple[str, str, int]] = [
     ("りせっと", "リセット", 500),
     # プログラム系
     ("ぷらす", "プラス", 500),
+    # Single bare-hiragana identity, narrow list.
+    #
+    # SKK ships rare single-kanji entries for most 1-char readings
+    # (る → 縷, ろ → 呂). At the SKK default cost 3000 they beat
+    # the 8000 hiragana fallback and become the default surface
+    # when the user pauses mid-composition on just one kana --
+    # typing "ると" briefly showed 縷 + と.
+    #
+    # Fix: register hiragana identity at cost 2800 for the handful
+    # of 1-char readings where the only kanji alternatives are
+    # archaic / uncommon. 2800 beats the 3000 SKK default by 200 so
+    # hiragana wins for a lone char, but stays expensive enough that
+    # compounds (typically cost 2500-2700) still win when the char
+    # is part of a longer word -- 走る (2500) still beats はし(3000)
+    # + る(2800) in はしる.
+    #
+    # Only these chars get the boost. Common single-kanji nouns
+    # like 木/手/目/火 (き/て/め/ひ) are excluded so the kanji still
+    # wins as the default for their readings.
+    ("る", "る", 2800), ("ろ", "ろ", 2800), ("れ", "れ", 2800),
+    ("ぬ", "ぬ", 2800),
+    ("ん", "ん", 2800),
     # 「と思う」が「遠もう」になる問題対策。
     # SKK に ``とおもう /遠もう/`` という稀な項目があって、と+思う
     # (split で 2500+200) よりコンパウンドが安くなってしまう。
@@ -1740,6 +1762,23 @@ EXTRA_WORDS: list[tuple[str, str, int]] = [
     ("おもう", "思う", 2300),
     ("おもった", "思った", 2300),
     ("おもっている", "思っている", 2300),
+    # 行き / 生き -- SKK has 行き at cost 3800 buried under 息/粋/
+    # 域/活/等. User reported 「いき」変換で 行き が候補に出ない.
+    # Boost both common verb-noun forms.
+    ("いき", "行き", 2500),
+    ("いき", "生き", 2700),
+    ("いきかた", "行き方", 2700),
+    ("いきさき", "行き先", 2700),
+    ("いきかえり", "行き帰り", 2700),
+    ("いきかえる", "行き帰る", 2800),
+    ("いきる", "生きる", 2500),
+    ("いきた", "生きた", 2500),
+    ("いきて", "生きて", 2500),
+    ("いきている", "生きている", 2500),
+    ("いきかた", "生き方", 2600),
+    ("なまいき", "生意気", 2700),  # 生意気 is one word, not 生+意気
+    ("しょうじき", "正直", 2700),
+    ("そうじき", "掃除機", 2700),
     # バグ vs 馬具 — tech context: バグ is vastly more common than 馬具
     ("ばぐ", "バグ", 2500),  # tie with 馬具 via bigram; after を prefer バグ
     # デビュー — the "び" often lookups as different. ensure デビュー wins
@@ -1816,9 +1855,13 @@ EXTRA_WORDS: list[tuple[str, str, int]] = [
     # 派 — penalize after 語 via grammatical rules (in language_model.py)
     # おり — common "されており" / "されていた" endings. SKK has 檻 (prison)
     # at cost 3000 which hijacks the suffix. Boost hiragana form.
-    ("おり", "おり", 300),
-    ("ており", "ており", 300),
-    ("されており", "されており", 300),
+    # おり / ており — hiragana boost to beat 檻 (prison, cost 3000).
+    # Keep cost above ~2500 so compounds like オリンピック (reading
+    # おりんぴっく, cost 2700) still win -- at cost 300 the
+    # "おり" split undercut オリンピック and produced おり+ン+ピック.
+    ("おり", "おり", 2700),
+    ("ており", "ており", 400),     # 3-char, safe at lower cost
+    ("されており", "されており", 300),  # 5-char, very safe
     # ような context-sensitive: 「のような」「のようなもの」は良し、
     # しかし「しゅような」→「主要な」 (adjective) を壊してはいけない
     # So we over-reduce ような and let 主要 win via its own EXTRA entry.

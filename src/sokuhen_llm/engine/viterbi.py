@@ -424,11 +424,19 @@ class Converter:
                often want a plain kana fallback near the top — especially
                for single-character readings).
             3. Remaining dictionary entries, sorted by cost.
+
+        For 1-char readings, SKK's kanji list is a long tail of
+        archaic / rare forms (る → 縷 / 鏤 / 婁 / 褸 / 瑠 / 璢 / 屡
+        / ...). Cycling through all of them with Space takes forever
+        and the user almost never wants any of them. Prune to the
+        top 3 entries plus the kana forms.
         """
         entries = sorted(
             (e for e in self.dict.lookup(reading_slice) if e.surface != chosen.surface),
             key=lambda e: e.cost,
         )
+        if len(reading_slice) == 1:
+            entries = entries[:3]
 
         hira = DictEntry(
             reading=reading_slice, surface=reading_slice, cost=8000, source="fallback"
