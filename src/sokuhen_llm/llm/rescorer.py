@@ -45,31 +45,71 @@ class RescoreConfig:
     """Knobs for the rescoring pass."""
 
     # Log-prob delta required for LLM to override the Viterbi choice.
-    # Lower = LLM more aggressive; higher = LLM more conservative.
-    # At 1.5 nats the LLM needs to be ~4.5× more confident in the
-    # alternative before overriding — high enough that style-preference
-    # flips (観た vs 見た, ちがう vs 違う) stop drowning out the real
-    # wins (事故 vs 自己, 使用 vs しよう).
+    #
+    # 1.5 nats = the LLM must be ~4.5× more confident in the alternative
+    # before overriding the dictionary. This combines with the augmented
+    # kana pool (``always_include_kana_forms``) to give the user's
+    # requested "LLMが変換を決める" behavior without breaking style:
+    #
+    #   * Archaic-kanji rescue (縷→る, 鳴ん→なん): LLM's preference is
+    #     many nats strong because the archaic form is nonsensical in
+    #     context -- it easily clears 1.5 nats.
+    #   * Wrong-kanji-among-commonly-used (事故 vs 自己, 使用 vs しよう):
+    #     real-context disambiguations are 2+ nats -- clears 1.5.
+    #   * Style-preference flips (及び↔および, 等↔など, 主に↔おもに):
+    #     web-trained LM prefers hiragana by 0.3-1.0 nats -- fails 1.5,
+    #     so dictionary's Wikipedia-formal kanji stays.
+    #   * Noise flips (区画→区が, 呼称→湖沼, 機能→昨日, 以下→行か):
+    #     wrong-kanji-but-similar-context -- fails 1.5.
+    #
+    # An earlier version of this config set threshold=0.0 to honor the
+    # user's "LLMが決める" request literally, but that allowed all of
+    # the above failure modes in, dropping wiki 89→81. The real way to
+    # honor the request is: make the kana form AVAILABLE to the LLM
+    # (via augmentation), but gate flips behind a "decisive confidence"
+    # threshold so noise-level preferences don't override the dict.
     score_threshold: float = 1.5
+
+    # Merge-pass threshold kept at 0.5 because segmentation changes
+    # affect multiple characters at once and noise-level flips there
+    # are more disruptive than within-segment flips.
+    merge_threshold: float = 0.5
 
     # Cap per-segment candidate consideration — the Viterbi candidate
     # list can be long for short readings, and we don't need to score
     # deep entries.
     max_candidates_per_segment: int = 4
 
+    # Add hiragana + katakana identity to the per-segment candidate
+    # pool before LLM rescoring, so the LLM can pick kana for a
+    # segment even when the dictionary only offered archaic kanji
+    # (る → 縷 / 鏤 / 婁 / ...).
+    #
+    # Gated on the top dictionary entry's cost because a web-trained
+    # LM has a systematic preference for hiragana over formal-writing
+    # kanji (年/主に/等/及び) that we don't want to expose: adding ねん
+    # to the 年 segment causes the LLM to flip to ねん in "1972年" even
+    # though that's clearly a formal-writing context where kanji is
+    # right. Only augment when the dict top pick looks archaic/rare.
+    always_include_kana_forms: bool = True
+    # Only augment when top dict entry cost > this. Common words (年,
+    # 主, 等, 呼称) are cost 300-2000; boosted loanwords sit at 2500-
+    # 2700; rare/archaic kanji like 縷, 鳴ん, 迸 are 3000+.
+    # Setting the gate at 2500 means:
+    #   * 縷, 鳴ん (cost 3000+) → augmented → LLM can fall back to kana
+    #   * 年, 主に, 等 (cost 500-1500) → NOT augmented → kanji preserved
+    #   * loanword entries (cost 2500-2700) → NOT augmented → kanji wins
+    kana_augment_cost_threshold: int = 2500
+
     # Viterbi-confidence gate: skip LLM rescoring entirely for a
     # segment if the gap between the best and second-best candidate
     # is at least this many units of dictionary cost.
     #
     # 0 (default) = disabled -- the LLM evaluates every ambiguous
-    # segment. Matches the user's "LLMモードの時はベースラインはなし"
-    # request: when LLM is enabled, its judgement is authoritative,
-    # not a sometimes-consulted second opinion.
-    #
-    # Positive values restore the gate for speed: 500 was the
-    # previous default (LLM only sees Viterbi-ties), 2000 = LLM
-    # only sees near-exact ties. Available for users who prefer
-    # speed over thoroughness.
+    # segment. Positive values restore the gate for speed:
+    #   500  = LLM only sees Viterbi-ties
+    #   2000 = LLM only sees near-exact ties
+    # Available for users who prefer speed over thoroughness.
     viterbi_confidence_gap: int = 0
 
     # Prefix prepended to the whole surface before scoring, useful for
@@ -149,18 +189,103 @@ class Rescorer:
             out.surface = result.surface_at(overrides)
             return out
 
-        # Current decision for each segment (index into candidates).
-        choices: list[int] = [
-            overrides.get(i, 0) for i in range(len(result.segments))
-        ]
         max_cands = self.config.max_candidates_per_segment
         threshold = self.config.score_threshold
         confidence_gap = self.config.viterbi_confidence_gap
         prefix_prompt = self.config.prompt_prefix
         hits = 0
 
-        for i, seg in enumerate(result.segments):
-            n_cands = min(len(seg.candidates), max_cands)
+        # Augment each segment's candidate list with hiragana and
+        # katakana identity so the LLM can pick kana for a segment
+        # even when the dictionary only offered archaic kanji
+        # (る → 縷 / 鏤 / 婁 / ...). The augmented segments become a
+        # new ConversionResult (``augmented_result``) that the composer
+        # will receive via alt_result; the composer's Space-cycle
+        # candidate list then includes these kana forms too.
+        if self.config.always_include_kana_forms:
+            augment_gate = self.config.kana_augment_cost_threshold
+            augmented_segments: list[ConversionSegment] = []
+            any_augmented = False
+            for seg in result.segments:
+                # Gate: only augment when the top dict entry looks
+                # archaic/rare. Common-word segments (年, 主に, 等) have
+                # cheap top entries and don't need kana augmentation;
+                # augmenting them would let the web-trained LM's hiragana
+                # bias flip formal-writing kanji (1972年→1972ねん,
+                # 主に→おもに, 等→など) which is worse than the archaic
+                # kanji we're trying to avoid.
+                top_cost = (
+                    seg.candidates[0].cost if seg.candidates else 99999
+                )
+                if top_cost <= augment_gate:
+                    augmented_segments.append(seg)
+                    continue
+                aug_cands = list(seg.candidates)
+                existing = {c.surface for c in aug_cands}
+                added = False
+                # Insert kana forms right after the top-``max_cands``
+                # dict entries so the LLM's ``n_cands``-sized batch sees
+                # them (appending at the end would hide them when dict
+                # has more than max_cands entries).
+                insert_pos = min(len(aug_cands), max_cands)
+                kana_inserts: list[DictEntry] = []
+                if seg.reading not in existing and seg.reading:
+                    kana_inserts.append(DictEntry(
+                        reading=seg.reading,
+                        surface=seg.reading,
+                        cost=4000,
+                        source="llm-pool-hira",
+                    ))
+                from ..engine.dictionary import hiragana_to_katakana
+                kata = hiragana_to_katakana(seg.reading)
+                if kata != seg.reading and kata not in existing:
+                    kana_inserts.append(DictEntry(
+                        reading=seg.reading,
+                        surface=kata,
+                        cost=4100,
+                        source="llm-pool-kata",
+                    ))
+                if kana_inserts:
+                    aug_cands = (
+                        aug_cands[:insert_pos]
+                        + kana_inserts
+                        + aug_cands[insert_pos:]
+                    )
+                    added = True
+                if added:
+                    any_augmented = True
+                augmented_segments.append(ConversionSegment(
+                    start=seg.start, end=seg.end,
+                    reading=seg.reading, surface=seg.surface,
+                    candidates=aug_cands,
+                ))
+            if any_augmented:
+                working_result = ConversionResult(
+                    reading=result.reading, segments=augmented_segments,
+                )
+            else:
+                working_result = result
+        else:
+            working_result = result
+
+        # Current decision for each segment (index into candidates).
+        # Computed against the augmented segments so the indices match.
+        choices: list[int] = [
+            overrides.get(i, 0) for i in range(len(working_result.segments))
+        ]
+
+        for i, seg in enumerate(working_result.segments):
+            # With augmentation, this segment may have had up to 2 kana
+            # forms inserted at positions [max_cands:max_cands+2]. Cap
+            # at max_cands + 2 so they're always inside the scoring
+            # batch. Non-augmented segments cap at max_cands as usual.
+            n_dict_kanji = sum(
+                1 for c in seg.candidates[:max_cands + 2]
+                if not c.source.startswith("llm-pool-")
+            )
+            n_augmented = len(seg.candidates[:max_cands + 2]) - n_dict_kanji
+            pool_size = max_cands + n_augmented
+            n_cands = min(len(seg.candidates), pool_size)
             if n_cands <= 1:
                 continue
             # Viterbi-confidence gate: if the top dictionary cost beats
@@ -186,7 +311,7 @@ class Rescorer:
             # segment instead of K times.
             prefix_full = prefix_prompt + frozen_prefix
             candidate_surfaces = [
-                _build_surface(prefix_full, result.segments, choices, i, k)
+                _build_surface(prefix_full, working_result.segments, choices, i, k)
                 for k in range(n_cands)
             ]
             scores = self.backend.score_batch(candidate_surfaces)
@@ -212,14 +337,22 @@ class Rescorer:
         #       ±2 chars so the LLM also sees near-miss splits where
         #       Viterbi's dictionary-cost picked a wrong boundary
         #       (_try_boundary_shifts).
+        #
+        # Segmentation passes use their own ``merge_threshold``. It
+        # can differ from the within-segment threshold, though in
+        # practice we want segmentation changes to be at least as
+        # conservative -- take ``max`` of the two so a user loosening
+        # ``score_threshold`` doesn't accidentally open the floodgates
+        # for multi-char segmentation flips.
+        merge_threshold = max(threshold, self.config.merge_threshold)
         alt_result: Optional[ConversionResult] = None
         if self.config.try_segment_merges and self.dictionary is not None:
-            working = result
+            working = working_result
             alt_result_merges, alt_hits_merges = self._try_merges(
                 frozen_prefix=prefix_prompt + frozen_prefix,
                 result=working,
                 choices=choices,
-                threshold=threshold,
+                threshold=merge_threshold,
             )
             hits += alt_hits_merges
             if alt_result_merges is not None:
@@ -232,13 +365,25 @@ class Rescorer:
                 frozen_prefix=prefix_prompt + frozen_prefix,
                 result=working,
                 choices=choices,
-                threshold=threshold,
+                threshold=merge_threshold,
             )
             hits += alt_hits_shift
             if alt_result_shift is not None:
                 alt_result = alt_result_shift
             elif alt_result_merges is not None:
                 alt_result = alt_result_merges
+
+        # If we augmented candidates but didn't otherwise change
+        # segmentation, still return the augmented result as alt_result
+        # so the composer's Space-cycle list includes the kana forms
+        # (the winning candidate might BE one of those kana entries
+        # that wasn't in the original seg.candidates).
+        if (
+            alt_result is None
+            and self.config.always_include_kana_forms
+            and working_result is not result
+        ):
+            alt_result = working_result
 
         out.overrides = overrides
         out.surface = (alt_result or result).surface_at(overrides if alt_result is None else {})
