@@ -461,7 +461,7 @@ class CompositionWindow(QWidget):
         p.setPen(FOOTER_COLOR)
 
         if self._candidates_visible:
-            hint = "↑↓ 選択   Enter 確定   Space 次   Esc 閉じる"
+            hint = "1-9 直接選択   ↑↓ 選択   Enter 確定   Space 次   Esc 閉じる"
         else:
             hint = "Space 候補一覧   ← → 文節   Shift+← → 幅変更   Enter 確定   Esc 取消"
 
@@ -470,5 +470,4 @@ class CompositionWindow(QWidget):
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
             hint,
         )
-
 

@@ -477,6 +477,15 @@ class ImeCore(QObject):
             self.state_changed.emit()
             return True
 
+        # Candidate panel number selection. The UI labels visible rows
+        # 1..9; when the panel is open, pressing the matching digit picks
+        # that candidate directly. Outside the panel digits remain normal
+        # text input (for dates, model numbers, percentages, etc.).
+        if self.composer.state.show_candidates and 0x31 <= vk <= 0x39:
+            if self.composer.choose_candidate(vk - 0x31):
+                self.state_changed.emit()
+            return True
+
         if vk == VK_TAB:
             # Tab commits (implicit confirm).
             if not self.composer.state.is_empty:

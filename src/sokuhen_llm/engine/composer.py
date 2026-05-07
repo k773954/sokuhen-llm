@@ -301,6 +301,24 @@ class LiveComposer:
         self.state.show_candidates = True
         self.state.manually_edited = True
 
+    def choose_candidate(self, candidate_index: int) -> bool:
+        """Select a candidate by zero-based index for the active segment.
+
+        Used by number-key selection while the candidate panel is open.
+        Returns True when a candidate was selected, False when the index is
+        out of range or there is no active conversion.
+        """
+        if self.state.result is None or not self.state.result.segments:
+            return False
+        idx = self.state.selected_segment
+        seg = self.state.result.segments[idx]
+        if not 0 <= candidate_index < len(seg.candidates):
+            return False
+        self.state.overrides[idx] = candidate_index
+        self.state.show_candidates = True
+        self.state.manually_edited = True
+        return True
+
     def hide_candidates(self) -> None:
         self.state.show_candidates = False
 
