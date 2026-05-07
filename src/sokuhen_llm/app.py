@@ -417,22 +417,21 @@ class ImeCore(QObject):
         ):
             return False
 
-        # Shift + ASCII letter: flush any pending composition and pass the
-        # keystroke through so the app receives a normal uppercase letter.
-        # Users commonly want to type identifiers, model numbers, English
-        # words etc. mid-sentence without toggling the IME off. Shift-A
-        # through Shift-Z keep their muscle-memory behavior and never
-        # enter the romaji→kana converter.
+        # Shift + ASCII letter: flush any pending composition and inject
+        # a normal uppercase letter ourselves. Passing the physical key
+        # through is not reliable while the native Windows IME is open:
+        # some layouts/IME states still route it through composition.
+        # Using the VK range keeps Shift+A..Z as direct English input
+        # regardless of what ToUnicodeEx reported for ev.char.
         if (
             ev.pressed
             and Modifiers.SHIFT in ev.modifiers
-            and ev.char
-            and len(ev.char) == 1
-            and "A" <= ev.char <= "Z"
+            and 0x41 <= ev.vk <= 0x5A
         ):
             if not self.composer.state.is_empty:
                 self._commit()
-            return False
+            send_unicode_text(chr(ev.vk))
+            return True
 
         if not ev.pressed:
             # IME is edge-triggered on key-down. Key-up passes through silently,
