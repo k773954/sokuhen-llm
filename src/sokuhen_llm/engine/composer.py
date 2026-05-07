@@ -55,6 +55,7 @@ BAKE_HYSTERESIS = 8
 # Punctuation always safe to bake across. These are unambiguous sentence
 # / phrase boundaries — the Viterbi rarely splits them weirdly.
 _SAFE_PUNCTUATION = frozenset("、。・！？!?\n")
+CANDIDATE_PAGE_SIZE = 9
 
 
 def _is_safe_boundary(reading: str) -> bool:
@@ -319,6 +320,45 @@ class LiveComposer:
         self.state.manually_edited = True
         return True
 
+    def active_candidate_index(self) -> int:
+        """Return the active segment's selected candidate index."""
+        if self.state.result is None or not self.state.result.segments:
+            return 0
+        idx = self.state.selected_segment
+        seg = self.state.result.segments[idx]
+        cur = self.state.overrides.get(idx, 0)
+        return max(0, min(cur, max(0, len(seg.candidates) - 1)))
+
+    def candidate_window_start(self, max_visible: int = CANDIDATE_PAGE_SIZE) -> int:
+        """First candidate index that should be visible in a paged list."""
+        if self.state.result is None or not self.state.result.segments:
+            return 0
+        seg = self.state.result.segments[self.state.selected_segment]
+        total = len(seg.candidates)
+        if total <= max_visible:
+            return 0
+        active = self.active_candidate_index()
+        return min(max(active - max_visible + 1, 0), total - max_visible)
+
+    def choose_visible_candidate(
+        self,
+        visible_row: int,
+        max_visible: int = CANDIDATE_PAGE_SIZE,
+    ) -> bool:
+        """Select a candidate by the visible row number in the current page."""
+        return self.choose_candidate(
+            self.candidate_window_start(max_visible) + visible_row
+        )
+
+    def choose_edge_candidate(self, last: bool) -> bool:
+        """Select the first or last candidate for the active segment."""
+        if self.state.result is None or not self.state.result.segments:
+            return False
+        seg = self.state.result.segments[self.state.selected_segment]
+        if not seg.candidates:
+            return False
+        return self.choose_candidate(len(seg.candidates) - 1 if last else 0)
+
     def hide_candidates(self) -> None:
         self.state.show_candidates = False
 
@@ -328,6 +368,45 @@ class LiveComposer:
             return
         n = len(self.state.result.segments)
         self.state.selected_segment = max(0, min(n - 1, self.state.selected_segment + delta))
+
+    def select_edge_segment(self, last: bool) -> None:
+        """Move the segment cursor to the first or last segment."""
+        if self.state.result is None or not self.state.result.segments:
+            return
+        self.state.selected_segment = len(self.state.result.segments) - 1 if last else 0
+
+    def delete_previous_chunk(self) -> bool:
+        """Delete the previous composition chunk, like Ctrl+Backspace.
+
+        For converted text, the chunk is the trailing conversion segment.
+        For pending romaji, it clears the unfinished syllable. This keeps
+        correction fast without accidentally deleting text already committed
+        to the foreground app.
+        """
+        if not self.state.active:
+            return False
+        if self.state.pending_romaji:
+            raw_delta = len(self.state.pending_romaji)
+            self.state.pending_romaji = ""
+            if raw_delta:
+                self.state.raw_input = self.state.raw_input[:-raw_delta]
+            self._reconvert()
+            return True
+        if self.state.kana_buffer:
+            cut_at = len(self.state.kana_buffer) - 1
+            if self.state.result is not None and self.state.result.segments:
+                cut_at = self.state.result.segments[-1].start
+            removed = len(self.state.kana_buffer) - cut_at
+            self.state.kana_buffer = self.state.kana_buffer[:cut_at]
+            if removed and self.state.raw_input:
+                self.state.raw_input = self.state.raw_input[:-removed]
+            self._reconvert()
+            return True
+        if self.state.frozen_surface:
+            self.state.frozen_surface = ""
+            self.state.frozen_last_surface = ""
+            return True
+        return False
 
     def resize_segment(self, delta: int) -> None:
         """Extend (+1) or shrink (-1) the END of the currently selected

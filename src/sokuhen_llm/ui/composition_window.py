@@ -32,7 +32,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import QApplication, QWidget
 
-from ..engine.composer import ComposerState
+from ..engine.composer import CANDIDATE_PAGE_SIZE, ComposerState
 from ..input import _win32
 
 
@@ -75,7 +75,7 @@ ACTIVE_UNDERLINE_H = 3
 INACTIVE_UNDERLINE_H = 1
 CAND_PADDING = 4
 CAND_ROW_HEIGHT = 30
-CAND_MAX_VISIBLE = 9
+CAND_MAX_VISIBLE = CANDIDATE_PAGE_SIZE
 CAND_INDEX_W = 26
 MIN_WIDTH = 380
 FOOTER_HEIGHT = 22
@@ -196,6 +196,11 @@ class CompositionWindow(QWidget):
     def _candidates_visible(self) -> bool:
         return bool(self._state and self._state.show_candidates)
 
+    def _footer_hint(self) -> str:
+        if self._candidates_visible:
+            return "1-9選択  ↑↓  PgUp/PgDn  Home/End  Enter  Esc"
+        return "Space候補  ←→文節  Shift+←→幅  Ctrl+Backspace削除  Enter確定"
+
     def _resize_to_content(self) -> None:
         if not self._state:
             return
@@ -204,17 +209,20 @@ class CompositionWindow(QWidget):
         display_text = self._state.display_text or " "
         text_w = fm.horizontalAdvance(display_text)
         text_h = fm.height()
+        footer_w = QFontMetrics(self._footer_font).horizontalAdvance(self._footer_hint())
 
-        w = max(text_w + PADDING_X * 2, MIN_WIDTH)
+        w = max(text_w + PADDING_X * 2, footer_w + PADDING_X * 2, MIN_WIDTH)
         h = text_h + PADDING_Y * 2 + ACTIVE_UNDERLINE_H + FOOTER_HEIGHT
 
         if self._candidates_visible and self._state.result and self._state.result.segments:
             seg = self._state.result.segments[self._state.selected_segment]
-            rows = min(CAND_MAX_VISIBLE, len(seg.candidates))
+            start = self._candidate_window_start()
+            rows = min(CAND_MAX_VISIBLE, len(seg.candidates) - start)
             cfm = self._cand_metrics()
             cand_text_w = max(
-                cfm.horizontalAdvance(c.surface) for c in seg.candidates[:rows]
-            )
+                cfm.horizontalAdvance(c.surface)
+                for c in seg.candidates[start:start + rows]
+            ) if rows else 0
             cand_w = CAND_INDEX_W + cand_text_w + CAND_PADDING * 4
             w = max(w, cand_w + CAND_PADDING * 2)
             h += rows * CAND_ROW_HEIGHT + CAND_PADDING * 2 + 2
@@ -264,6 +272,17 @@ class CompositionWindow(QWidget):
         _win32.set_topmost(int(self.winId()))
 
     # -- painting --------------------------------------------------------
+
+    def _candidate_window_start(self) -> int:
+        """First candidate index to show, keeping the active one visible."""
+        assert self._state is not None and self._state.result is not None
+        seg = self._state.result.segments[self._state.selected_segment]
+        total = len(seg.candidates)
+        if total <= CAND_MAX_VISIBLE:
+            return 0
+        active_idx = self._state.overrides.get(self._state.selected_segment, 0)
+        active_idx = max(0, min(active_idx, total - 1))
+        return min(max(active_idx - CAND_MAX_VISIBLE + 1, 0), total - CAND_MAX_VISIBLE)
 
     def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 (Qt API)
         painter = QPainter(self)
@@ -372,8 +391,9 @@ class CompositionWindow(QWidget):
         assert self._state is not None and self._state.result is not None
         seg = self._state.result.segments[self._state.selected_segment]
         active_idx = self._state.overrides.get(self._state.selected_segment, 0)
+        start = self._candidate_window_start()
 
-        rows = min(CAND_MAX_VISIBLE, len(seg.candidates))
+        rows = min(CAND_MAX_VISIBLE, len(seg.candidates) - start)
         y_start = (
             PADDING_Y
             + self._active_metrics().height()
@@ -391,16 +411,16 @@ class CompositionWindow(QWidget):
         p.drawRoundedRect(panel, 6, 6)
 
         p.setFont(self._cand_font)
-        fm = p.fontMetrics()
         for row in range(rows):
-            cand = seg.candidates[row]
+            candidate_index = start + row
+            cand = seg.candidates[candidate_index]
             row_rect = QRect(
                 panel.left() + CAND_PADDING,
                 panel.top() + CAND_PADDING + row * CAND_ROW_HEIGHT,
                 panel.width() - CAND_PADDING * 2,
                 CAND_ROW_HEIGHT,
             )
-            selected = row == active_idx
+            selected = candidate_index == active_idx
 
             # Row background
             if selected:
@@ -460,14 +480,8 @@ class CompositionWindow(QWidget):
         p.setFont(self._footer_font)
         p.setPen(FOOTER_COLOR)
 
-        if self._candidates_visible:
-            hint = "1-9 直接選択   ↑↓ 選択   Enter 確定   Space 次   Esc 閉じる"
-        else:
-            hint = "Space 候補一覧   ← → 文節   Shift+← → 幅変更   Enter 確定   Esc 取消"
-
         p.drawText(
             footer_rect.adjusted(PADDING_X, 0, -PADDING_X, 0),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            hint,
+            self._footer_hint(),
         )
-

@@ -39,16 +39,22 @@ from .input.hook import (
     VK_F8,
     VK_F9,
     VK_F10,
+    VK_HOME,
     VK_IME_OFF,
     VK_IME_ON,
     VK_KANJI,
     VK_LEFT,
+    VK_NEXT,
     VK_NONCONVERT,
+    VK_NUMPAD1,
+    VK_NUMPAD9,
     VK_OEM_3,
+    VK_PRIOR,
     VK_RETURN,
     VK_RIGHT,
     VK_SPACE,
     VK_TAB,
+    VK_END,
     VK_UP,
 )
 
@@ -409,6 +415,21 @@ class ImeCore(QObject):
         if not self.effective_active:
             return False
 
+        # Ctrl+Backspace while composing deletes the previous IME chunk.
+        # Handle it before the general Ctrl shortcut passthrough so common
+        # correction muscle memory works inside the composition buffer.
+        if (
+            ev.pressed
+            and ev.vk == VK_BACK
+            and Modifiers.CTRL in ev.modifiers
+            and Modifiers.ALT not in ev.modifiers
+            and Modifiers.WIN not in ev.modifiers
+        ):
+            if self.composer.delete_previous_chunk():
+                self.state_changed.emit()
+                return True
+            return False
+
         # Pass through Ctrl/Win combos — the user is doing an app shortcut.
         if (
             Modifiers.CTRL in ev.modifiers
@@ -479,10 +500,15 @@ class ImeCore(QObject):
 
         # Candidate panel number selection. The UI labels visible rows
         # 1..9; when the panel is open, pressing the matching digit picks
-        # that candidate directly. Outside the panel digits remain normal
-        # text input (for dates, model numbers, percentages, etc.).
-        if self.composer.state.show_candidates and 0x31 <= vk <= 0x39:
-            if self.composer.choose_candidate(vk - 0x31):
+        # that visible row directly. Top-row and numpad digits both work.
+        # Outside the panel digits remain normal text input.
+        digit_row: int | None = None
+        if 0x31 <= vk <= 0x39:
+            digit_row = vk - 0x31
+        elif VK_NUMPAD1 <= vk <= VK_NUMPAD9:
+            digit_row = vk - VK_NUMPAD1
+        if self.composer.state.show_candidates and digit_row is not None:
+            if self.composer.choose_visible_candidate(digit_row):
                 self.state_changed.emit()
             return True
 
@@ -511,6 +537,40 @@ class ImeCore(QObject):
                 self.composer.resize_segment(+1)
             else:
                 self.composer.select_segment(+1)
+            self.state_changed.emit()
+            return True
+
+        if vk == VK_HOME:
+            if self.composer.state.is_empty:
+                return False
+            if self.composer.state.show_candidates:
+                self.composer.choose_edge_candidate(last=False)
+            else:
+                self.composer.select_edge_segment(last=False)
+            self.state_changed.emit()
+            return True
+
+        if vk == VK_END:
+            if self.composer.state.is_empty:
+                return False
+            if self.composer.state.show_candidates:
+                self.composer.choose_edge_candidate(last=True)
+            else:
+                self.composer.select_edge_segment(last=True)
+            self.state_changed.emit()
+            return True
+
+        if vk == VK_PRIOR:
+            if self.composer.state.is_empty:
+                return False
+            self.composer.next_candidate(-9)
+            self.state_changed.emit()
+            return True
+
+        if vk == VK_NEXT:
+            if self.composer.state.is_empty:
+                return False
+            self.composer.next_candidate(+9)
             self.state_changed.emit()
             return True
 
