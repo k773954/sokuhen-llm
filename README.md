@@ -8,11 +8,13 @@ Windows 向け、**ローカル超軽量日本語 LLM** で文脈を見ながら
 - 「書類を**しよう**する」 vs 「書類を**使用**する」
 - 「**以降**も変わらず」 vs 「**行こう**も変わらず」
 
-## 使用デモ
+## 使用デモ動画
 
-[![sokuhen-llm usage demo](assets/sokuhen-llm-usage-demo-poster.png)](assets/sokuhen-llm-usage-demo.mp4)
+[![sokuhen-llm 使用デモ](assets/sokuhen-llm-usage-demo-poster.png)](assets/sokuhen-llm-usage-demo.mp4)
 
-動画では、IME の ON/OFF、ライブ変換、候補一覧、数字キーでの直接選択、`Ctrl+Backspace` での直前チャンク削除、`Shift+英字` の直接入力、`Enter` 確定までを一通り確認できます。
+[MP4 を開く](assets/sokuhen-llm-usage-demo.mp4)
+
+IME の ON/OFF、ライブ変換、候補一覧、数字キーでの直接選択、`Ctrl+Backspace` での直前チャンク削除、`Shift+英字` の直接入力、`Enter` 確定までを一通り確認できます。
 
 ## 完全ローカル
 
