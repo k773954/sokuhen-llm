@@ -10,9 +10,7 @@ Windows 向け、**ローカル超軽量日本語 LLM** で文脈を見ながら
 
 ## 使用デモ動画
 
-[![sokuhen-llm 使用デモ](assets/sokuhen-llm-usage-demo-poster.png)](assets/sokuhen-llm-usage-demo.mp4)
-
-[MP4 を開く](assets/sokuhen-llm-usage-demo.mp4)
+![sokuhen-llm 使用デモ](assets/sokuhen-llm-usage-demo.gif)
 
 IME の ON/OFF、ライブ変換、候補一覧、数字キーでの直接選択、`Ctrl+Backspace` での直前チャンク削除、`Shift+英字` の直接入力、`Enter` 確定までを一通り確認できます。
 
