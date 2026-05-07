@@ -677,7 +677,16 @@ _CONJ_TABLE: dict[str, list[tuple[str, str, int]]] = {
         ("く", "く", 0), ("いた", "いた", 20), ("いて", "いて", 20),
         ("かない", "かない", 30), ("きます", "きます", 30), ("こう", "こう", 50),
         ("けば", "けば", 60), ("かれ", "かれ", 70), ("かせ", "かせ", 70),
-        ("きたい", "きたい", 40), ("ける", "ける", 40),
+        ("きたい", "きたい", 40),
+        # Potential-family forms. SKK also encodes several lexicalized
+        # ichidan-looking compounds as k-stems, notably みつk/見付.
+        # Generating the inflected け-* forms keeps 見付けて/見付けた
+        # reachable instead of letting the Viterbi split みつけて as
+        # [実][つけて].
+        ("ける", "ける", 40), ("けた", "けた", 40), ("けて", "けて", 40),
+        ("けない", "けない", 50), ("けます", "けます", 50),
+        ("ければ", "ければ", 60), ("けよう", "けよう", 60),
+        ("けている", "けている", 60), ("けていた", "けていた", 70),
     ],
     "g": [  # godan ぐ (泳ぐ)
         ("ぐ", "ぐ", 0), ("いだ", "いだ", 20), ("いで", "いで", 20),
