@@ -146,6 +146,46 @@ _PARTICLE_BREAKS = frozenset("をのにはがともやへかよねわでん")
 _MAX_FOREIGN_RUN = 6  # cap the scan distance — longer runs likely span words
 
 
+_PAREN_CLOSE = {"（": "）", "(": ")"}
+_PROTECTED_PAREN_MAX = 24
+_PROTECTED_PAREN_CHARS = set(
+    "ぁあぃいぅうぇえぉおかがきぎくぐけげこご"
+    "さざしじすずせぜそぞただちぢっつづてでとど"
+    "なにぬねのはばぱひびぴふぶぷへべぺほぼぽ"
+    "まみむめもゃやゅゆょよらりるれろゎわゐゑをん"
+    "ァアィイゥウェエォオカガキギクグケゲコゴ"
+    "サザシジスズセゼソゾタダチヂッツヅテデトド"
+    "ナニヌネノハバパヒビピフブプヘベペホボポ"
+    "マミムメモャヤュユョヨラリルレロヮワヰヱヲン"
+    "ー、，・ "
+)
+
+
+def _protected_parenthetical_end(text: str, start: int) -> int:
+    """Return the end of a kana-only parenthetical note, or start.
+
+    Wikipedia-style prose often contains furigana in parentheses:
+    ``富士山（ふじさん）``. From an IME perspective, the user typed
+    those kana deliberately and expects them to remain kana, not to be
+    reconverted to ``富士山`` again. We therefore add a cheap passthrough
+    lattice node for short kana-only parentheticals.
+    """
+    close = _PAREN_CLOSE.get(text[start])
+    if close is None:
+        return start
+    limit = min(len(text), start + _PROTECTED_PAREN_MAX + 2)
+    try:
+        end = text.index(close, start + 1, limit)
+    except ValueError:
+        return start
+    inner = text[start + 1:end]
+    if not inner or not any(c not in "、，・ " for c in inner):
+        return start
+    if all(c in _PROTECTED_PAREN_CHARS for c in inner):
+        return end + 1
+    return start
+
+
 def _foreign_run(reading: str, start: int) -> int:
     """If ``reading[start:]`` starts a "foreign-looking" run, return the
     exclusive end index. Otherwise return ``start`` (no run).
@@ -287,6 +327,18 @@ class Converter:
                 continue
             # Collect entries that can start at i.
             candidates: list[tuple[int, DictEntry]] = []
+            protected_end = _protected_parenthetical_end(reading, i)
+            if protected_end > i:
+                protected = reading[i:protected_end]
+                candidates.append((
+                    protected_end - i,
+                    DictEntry(
+                        reading=protected,
+                        surface=protected,
+                        cost=50,
+                        source="paren-kana",
+                    ),
+                ))
             lens = self.dict.candidate_lengths_at(reading, i)
             for ln in lens:
                 for e in self.dict.lookup(reading[i : i + ln]):
