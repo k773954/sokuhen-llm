@@ -138,6 +138,8 @@ class ImeCore(QObject):
         # judgement. We coalesce rapid keystrokes with a debounce timer
         # and use a generation token to discard stale results.
         self._live_rescore_gen = 0
+        self._live_rescore_inflight = False
+        self._live_rescore_pending = False
         self._live_rescore_worker = None  # threading.Thread while in flight
         self._live_rescore_debounce = QTimer()
         self._live_rescore_debounce.setSingleShot(True)
@@ -197,6 +199,12 @@ class ImeCore(QObject):
         rescorer = self.composer.rescorer
         if rescorer is None or getattr(rescorer, "status", "") != "ready":
             return
+        if self._live_rescore_inflight:
+            # The LLM backend is CPU-heavy and not guaranteed to be
+            # re-entrant. Keep a single worker in flight and remember
+            # that the newest state still needs a pass after it finishes.
+            self._live_rescore_pending = True
+            return
         gen = self._live_rescore_gen
         frozen = state.frozen_surface
         result = state.result
@@ -216,58 +224,81 @@ class ImeCore(QObject):
             # Marshall back to Qt main thread.
             self._live_rescore_done.emit(gen, out)
 
-        threading.Thread(target=worker, daemon=True, name="sokuhen-llm-rescore").start()
+        self._live_rescore_inflight = True
+        self._live_rescore_pending = False
+        self._live_rescore_worker = threading.Thread(
+            target=worker,
+            daemon=True,
+            name="sokuhen-llm-rescore",
+        )
+        self._live_rescore_worker.start()
 
     def _apply_live_rescore(self, gen: int, rescore_result: object) -> None:
         """Runs on the Qt main thread. Applies the LLM's preferred
         overrides iff the composer state hasn't moved on since we
         scheduled this pass."""
-        # Signal end of "LLM is thinking" animation unconditionally --
-        # even stale / errored results are a completion from the UI's
-        # perspective.
-        self.llm_thinking_changed.emit(False)
-        if rescore_result is None:
-            return
-        if gen != self._live_rescore_gen:
-            return  # a newer rescore has been scheduled
+        try:
+            if rescore_result is None:
+                return
+            if gen != self._live_rescore_gen:
+                return  # a newer rescore has been scheduled
+            state = self.composer.state
+            if state.result is None or state.is_empty:
+                return
+            # Key must still match — guards against "user kept typing
+            # while we were rescoring, new Viterbi result supersedes".
+            if (state.kana_buffer, state.frozen_surface) != self._last_rescore_key:
+                return
+            # If the user manually edited while we were rescoring, their
+            # choice is authoritative -- do NOT overwrite it with LLM's
+            # preference, even if this rescore pass was scheduled before
+            # the Space press.
+            if state.manually_edited:
+                return
+            new_overrides = getattr(rescore_result, "overrides", None) or {}
+            hits = getattr(rescore_result, "llm_hits", 0)
+            alt_result = getattr(rescore_result, "alt_result", None)
+
+            changed = False
+            if alt_result is not None:
+                # LLM picked a different segmentation (merged adjacent
+                # segments). Replace the composer's ConversionResult and
+                # reset overrides -- candidate indices are different
+                # across segmentations.
+                state.result = alt_result
+                state.overrides = {}
+                # Clamp selected_segment to the new segment count.
+                if state.selected_segment >= len(alt_result.segments):
+                    state.selected_segment = max(0, len(alt_result.segments) - 1)
+                changed = True
+            elif new_overrides != state.overrides:
+                state.overrides = dict(new_overrides)
+                changed = True
+
+            if not changed:
+                return
+            if hits > 0:
+                self.llm_rescored.emit()
+            self.state_changed.emit()
+        finally:
+            self._live_rescore_inflight = False
+            self._live_rescore_worker = None
+            if self._live_rescore_pending and self._can_start_followup_rescore():
+                self._live_rescore_pending = False
+                self._live_rescore_debounce.start()
+            else:
+                self._live_rescore_pending = False
+                self.llm_thinking_changed.emit(False)
+
+    def _can_start_followup_rescore(self) -> bool:
+        """True when a queued latest-state LLM pass still makes sense."""
         state = self.composer.state
-        if state.result is None or state.is_empty:
-            return
-        # Key must still match — guards against "user kept typing
-        # while we were rescoring, new Viterbi result supersedes".
+        if state.result is None or state.is_empty or state.manually_edited:
+            return False
         if (state.kana_buffer, state.frozen_surface) != self._last_rescore_key:
-            return
-        # If the user manually edited while we were rescoring, their
-        # choice is authoritative -- do NOT overwrite it with LLM's
-        # preference, even if this rescore pass was scheduled before
-        # the Space press.
-        if state.manually_edited:
-            return
-        new_overrides = getattr(rescore_result, "overrides", None) or {}
-        hits = getattr(rescore_result, "llm_hits", 0)
-        alt_result = getattr(rescore_result, "alt_result", None)
-
-        changed = False
-        if alt_result is not None:
-            # LLM picked a different segmentation (merged adjacent
-            # segments). Replace the composer's ConversionResult and
-            # reset overrides -- candidate indices are different
-            # across segmentations.
-            state.result = alt_result
-            state.overrides = {}
-            # Clamp selected_segment to the new segment count.
-            if state.selected_segment >= len(alt_result.segments):
-                state.selected_segment = max(0, len(alt_result.segments) - 1)
-            changed = True
-        elif new_overrides != state.overrides:
-            state.overrides = dict(new_overrides)
-            changed = True
-
-        if not changed:
-            return
-        if hits > 0:
-            self.llm_rescored.emit()
-        self.state_changed.emit()
+            return False
+        rescorer = self.composer.rescorer
+        return rescorer is not None and getattr(rescorer, "status", "") == "ready"
 
     def _poll_os_ime_state(self) -> None:
         """Passive OS IME state poll (WM_IME_CONTROL, no
@@ -560,10 +591,6 @@ class ImeCore(QObject):
             self.state_changed.emit()
             return True
         text = self.composer.commit()
-        llm_fired = (
-            getattr(self.composer, "rescorer", None) is not None
-            and getattr(self.composer.rescorer, "status", None) == "ready"
-        )
         if text:
             # Inject into the foreground app. The hook marks our
             # SendInput events as INJECTED so we don't re-process them.
@@ -574,8 +601,6 @@ class ImeCore(QObject):
                     "accepted the text (try clicking the target text field).",
                     text,
                 )
-        if llm_fired:
-            self.llm_rescored.emit()
         self._save_timer.start()
         self.state_changed.emit()
         return True
@@ -738,6 +763,7 @@ class _AsyncRescorer:
         self._real = None
         self._status = self._STATUS_LOADING
         self._status_lock = threading.Lock()
+        self._rescore_lock = threading.Lock()
         self._status_callback = None  # set by app.py after UI exists
         self._error_message = ""
         self._active_model_id = model_id
@@ -786,7 +812,12 @@ class _AsyncRescorer:
                 surface=result.surface_at(initial_overrides or {}),
                 llm_hits=0,
             )
-        return real.rescore(frozen_prefix, result, initial_overrides)
+        # HF model inference plus the shared score caches are process-wide
+        # resources. Serialize access here so callers do not need to know
+        # whether they are running from commit, live preview, or a future
+        # worker path.
+        with self._rescore_lock:
+            return real.rescore(frozen_prefix, result, initial_overrides)
 
     # --- worker thread ---------------------------------------------
 
