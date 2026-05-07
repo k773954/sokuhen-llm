@@ -12,3 +12,7 @@
 *.md   text
 *.toml text
 *.json text
+
+# Demo/media assets.
+*.mp4 binary
+*.png binary

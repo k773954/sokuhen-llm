@@ -2,11 +2,17 @@
 
 Windows 向け、**ローカル超軽量日本語 LLM** で文脈を見ながら変換する macOS ライクなライブ変換 IME。
 
-`sokuhen` (即変) のエンジンに、Commit 時の LLM 再ランク層 (rescoring) を追加したバージョンです。同音異義語の選択を「辞書コスト + バイグラム」だけではなく、**文全体の自然さ**から判断するようになります。
+`sokuhen` (即変) のエンジンに、入力中の LLM 再ランク層 (rescoring) を追加したバージョンです。同音異義語の選択を「辞書コスト + バイグラム」だけではなく、**文全体の自然さ**から判断するようになります。
 
 - 「会議で**事故**が発生した」 vs 「会議で**自己**が発生した」
 - 「書類を**しよう**する」 vs 「書類を**使用**する」
 - 「**以降**も変わらず」 vs 「**行こう**も変わらず」
+
+## 使用デモ
+
+[![sokuhen-llm usage demo](assets/sokuhen-llm-usage-demo-poster.png)](assets/sokuhen-llm-usage-demo.mp4)
+
+動画では、IME の ON/OFF、ライブ変換、候補一覧、数字キーでの直接選択、`Ctrl+Backspace` での直前チャンク削除、`Shift+英字` の直接入力、`Enter` 確定までを一通り確認できます。
 
 ## 完全ローカル
 
@@ -31,19 +37,18 @@ Windows 向け、**ローカル超軽量日本語 LLM** で文脈を見ながら
       ↓
 [Viterbi 変換] ← SKK-JISYO.L / edict2 / バイグラム LM / ユーザー学習
       ↓ top-N candidates per segment
-[ライブ表示]     ← ここまでは sokuhen と同じ (<1 ms / keystroke)
-      ↓
-     ...
-      ↓ Enter (commit)
 ┌─────────────────────────────────────────────────────┐
 │ [LLM Rescoring]                                      │
+│   debounce after typing; latest state only           │
 │   for each segment:                                  │
 │     for each top-K candidate:                        │
 │       score = LLM.logprob(frozen + surface sequence) │
 │     pick max                                         │
-│   ~200 ms total on CPU                               │
+│   runs on a background worker                        │
 └─────────────────────────────────────────────────────┘
       ↓ LLM-preferred surface
+[ライブ表示]
+      ↓ Enter (commit)
 [SendInput / PostMessageW]
 ```
 
@@ -53,11 +58,11 @@ Windows 向け、**ローカル超軽量日本語 LLM** で文脈を見ながら
 
 | タイミング | LLM 呼び出し | レスポンス |
 |---|---|---|
-| キー入力中 | なし | < 1 ms (sokuhen と同じ) |
+| キー入力中 | あり (debounce + 最新状態のみ) | キーフックは即時応答、再スコアは背景スレッド |
 | Space (候補選択) | なし | 瞬時 |
-| **Enter (確定)** | あり | ~200 ms (CPU, 110M model) |
+| **Enter (確定)** | なし (表示中の候補を確定) | 瞬時 |
 
-ライブ表示中は LLM を呼ばないので、タイピング感はライブ変換の滑らかさを保ちつつ、確定のタイミングで最良の変換に仕上がる設計です。
+LLM は入力のたびに直接ブロックせず、短い debounce 後に背景スレッドで最新の変換状態だけを再評価します。ユーザーが Space や矢印キーで候補を手動選択した後は、その選択を尊重して LLM の上書きを止めます。
 
 ## 動作要件
 
@@ -144,7 +149,13 @@ sokuhen と同じ。
 | 半角/全角、英数、無変換等 | OS IME 状態に自動追従 |
 | 英字キー | ローマ字→かな合成 |
 | `Space` | 候補選択 |
-| `Enter` | 確定 (**LLM rescoring 発動**) |
+| `1-9` / テンキー `1-9` | 候補一覧表示中の直接選択 |
+| `↑` / `↓` | 候補移動 |
+| `PgUp` / `PgDn` | 候補を9件単位で移動 |
+| `Home` / `End` | 候補または文節の先頭/末尾へ移動 |
+| `Ctrl + Backspace` | 変換中の直前チャンク削除 |
+| `Shift + 英字` | 日本語入力中でも英字を直接入力 |
+| `Enter` | 確定 |
 | `Esc` | 取消 |
 | `F7-F10` | カナ/半角カナ/全角英数/半角英数 |
 
