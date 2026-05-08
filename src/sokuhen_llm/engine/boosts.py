@@ -155,9 +155,12 @@ PARTICLES: dict[str, int] = {
 }
 
 
-# Extra common words that are absent or hard-to-reach in SKK-JISYO.L.
-# Each entry (reading, surface, cost) gets added with the dict source tag.
-# Keep this list small and curated — the learning LM will pick up the rest.
+# Extra common *word-level* candidates that are absent or hard-to-reach in
+# SKK-JISYO.L. These are not allowed to act as sentence shortcuts: entries
+# that span case particles or auxiliary chains are filtered by
+# ``should_register_extra_word`` before they enter the runtime dictionary.
+# Contextual choice should come from the real dictionaries plus the LLM
+# rescoring layer, not from memorized sentence fragments.
 EXTRA_WORDS: list[tuple[str, str, int]] = [
     # === core time / calendar nouns (beat okuri-ari bogus forms) ===
     ("あした", "明日", 2700), ("きょう", "今日", 2600),
@@ -2887,3 +2890,100 @@ def particle_cost(surface: str) -> int | None:
     """Return the preferred cost for a known particle/function-word surface,
     or None if the surface is not in the table."""
     return PARTICLES.get(surface)
+
+
+_CASE_PARTICLES = frozenset("はがをにへでとやも")
+_PARTICLE_BRIDGE = _CASE_PARTICLES | frozenset({"の"})
+_AUXILIARY_CHAINS = (
+    "しています", "している", "していた", "していない",
+    "されている", "されていた", "される", "された", "されて",
+    "しました", "します", "しない", "した", "して", "する",
+    "になった", "になり", "になる",
+    "である", "でもある",
+)
+_FIXED_SENTENCE_FRAGMENTS = (
+    "お願いします", "ございました", "ございます",
+    "申し訳ございません", "お疲れ様です", "お疲れ様でした",
+)
+
+
+def should_register_extra_word(reading: str, surface: str) -> bool:
+    """Return True for word-level extras, False for sentence shortcuts.
+
+    The extra table historically accumulated corpus-specific fragments such
+    as ``事故が発生`` and ``機械学習の精度``. Those improve individual tests
+    but bypass the intended architecture: dictionary candidates should be
+    word-level, and sentence/context selection should be handled by the LLM.
+    This filter keeps lexical compounds while rejecting entries that cross
+    particle boundaries or bake in auxiliary phrase chains.
+    """
+    del reading  # surface shape is the reliable signal for phrase shortcuts.
+    if _has_content_particle_bridge(surface):
+        return False
+    if _has_fixed_sentence_fragment(surface):
+        return False
+    if _has_auxiliary_chain(surface):
+        return False
+    if _is_long_kana_grammar(surface):
+        return False
+    return True
+
+
+def should_register_function_word(surface: str) -> bool:
+    """Return True for particles/auxiliary words, False for fixed sentences."""
+    if _has_content_particle_bridge(surface):
+        return False
+    if _has_fixed_sentence_fragment(surface):
+        return False
+    if _has_auxiliary_chain(surface):
+        return False
+    if _is_long_kana_grammar(surface):
+        return False
+    return True
+
+
+def _is_content_char(ch: str) -> bool:
+    cp = ord(ch)
+    return (
+        0x3400 <= cp <= 0x9FFF  # CJK ideographs
+        or 0x30A0 <= cp <= 0x30FF  # katakana
+        or ch.isascii() and ch.isalnum()
+    )
+
+
+def _has_content_particle_bridge(surface: str) -> bool:
+    for i, ch in enumerate(surface):
+        if ch not in _PARTICLE_BRIDGE:
+            continue
+        prev_is_content = i > 0 and _is_content_char(surface[i - 1])
+        next_is_content = i + 1 < len(surface) and _is_content_char(surface[i + 1])
+        if ch in _CASE_PARTICLES and (prev_is_content or next_is_content):
+            return True
+        if ch == "の" and prev_is_content:
+            return True
+    return False
+
+
+def _has_auxiliary_chain(surface: str) -> bool:
+    for chain in _AUXILIARY_CHAINS:
+        pos = surface.find(chain)
+        if pos <= 0:
+            continue
+        if _is_content_char(surface[pos - 1]):
+            return True
+    return False
+
+
+def _has_fixed_sentence_fragment(surface: str) -> bool:
+    return any(fragment in surface for fragment in _FIXED_SENTENCE_FRAGMENTS)
+
+
+def _is_long_kana_grammar(surface: str) -> bool:
+    if len(surface) < 6:
+        return False
+    if not all(0x3040 <= ord(ch) <= 0x309F for ch in surface):
+        return False
+    # Long pure-hiragana extras are almost always grammatical fragments or
+    # fixed expressions rather than dictionary words. Keep shorter function
+    # words in PARTICLES; do not let EXTRA_WORDS memorize whole clauses.
+    return True

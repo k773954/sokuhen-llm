@@ -12,7 +12,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-from .boosts import EXTRA_WORDS, FOREIGN_WORDS, PARTICLES, particle_cost
+from .boosts import (
+    EXTRA_WORDS,
+    FOREIGN_WORDS,
+    PARTICLES,
+    particle_cost,
+    should_register_extra_word,
+    should_register_function_word,
+)
 
 
 # SKK annotations like "word;meaning" — we drop the annotation for display
@@ -445,7 +452,15 @@ class Dictionary:
         "keeki" which becomes けえき, not けーき.
         """
         for surface, cost in PARTICLES.items():
-            self.add(DictEntry(reading=surface, surface=surface, cost=cost, source="particle"))
+            if should_register_function_word(surface):
+                self.add(
+                    DictEntry(
+                        reading=surface,
+                        surface=surface,
+                        cost=cost,
+                        source="particle",
+                    )
+                )
         for reading in FOREIGN_WORDS:
             kata = hiragana_to_katakana(reading)
             if kata == reading:
@@ -460,7 +475,10 @@ class Dictionary:
                     DictEntry(reading=alt, surface=kata, cost=500, source="foreign")
                 )
         for reading, surface, cost in EXTRA_WORDS:
-            self.add(DictEntry(reading=reading, surface=surface, cost=cost, source="extra"))
+            if should_register_extra_word(reading, surface):
+                self.add(
+                    DictEntry(reading=reading, surface=surface, cost=cost, source="extra")
+                )
 
     # --- lookup ----------------------------------------------------------
 
